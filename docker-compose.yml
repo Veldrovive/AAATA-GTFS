@@ -1,0 +1,18 @@
+services:
+  # The collector (scripts/collect.py). Data goes to ./data on the host.
+  collector:
+    build: .
+    image: aaata-gtfs:latest
+    command: ["collect.py"]
+    # Run as the host user so ./data stays owned by them (export UID/GID or put
+    # them in .env; bash doesn't export UID by default, hence the fallbacks).
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      # Create ./data first (mkdir -p data), or Docker creates it owned by root.
+      - ./data:/app/data
+    restart: unless-stopped
+    # The collector handles SIGTERM: it records the run's stop time and closes the DB.
+    stop_grace_period: 30s
+
+  # Template: run another script against the same data, e.g.
+  #   docker compose run --rm collector collector_status.py

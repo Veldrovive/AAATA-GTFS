@@ -1,14 +1,33 @@
 [project]
 name = "aaata-gtfs"
 version = "0.1.0"
-description = "Add your description here"
+description = "Collector and tools for TheRide (AAATA) GTFS-realtime and static GTFS data"
 readme = "README.md"
 authors = [
     { name = "Aidan Dempster", email = "aidan.dempster@gmail.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "folium>=0.20.0",
+    "gtfs-realtime-bindings>=3.0.0",
+    "httpx>=0.28.1",
+    "numpy>=2.5.4",
+    "xyzservices>=2026.9.1",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.7,<0.12.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.4.0",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not live'"
+markers = [
+    "live: hits TheRide's real feeds (needs network); run with `uv run pytest -m live`",
+]
