@@ -6,7 +6,8 @@ parameters from its seed, simulates fresh evaluation trips, and forecasts
 from every ping with the true parameters, each given fit (`--out` .npz files
 of runs with the same seed and route), the uninformed starting values, and a
 constant-speed baseline. Positions are only scored while the bus is still on
-its trip. Prints the scores per horizon and plots them. Needs the `model` extra
+its trip, unless `--score-arrived` (then a bus at the end is scored there: which
+positions are scored no longer depends on the outcome). Prints the scores per horizon and plots them. Needs the `model` extra
 (torch and matplotlib).
 """
 import argparse
@@ -49,24 +50,24 @@ def combine(parts: Sequence[list[HorizonScore]]) -> list[HorizonScore]:
 
 
 def model_scores(model: ForwardModel, theta: Parameters, trips: list[TripObservations], horizons: np.ndarray,
-                 chunk: int) -> list[HorizonScore]:
+                 chunk: int, include_arrived: bool = False) -> list[HorizonScore]:
     centres, end_ft = model.layout.cell_centers_ft(), model.layout.cell_centers_ft()[-1]
     parts = []
     for i in range(0, len(trips), chunk):
         part = trips[i:i + chunk]
         fc = model.forecast(theta, make_batch(part), horizons.tolist())
-        truth, scored = forecast_targets(part, fc.trip, fc.origin_step, fc.horizons, end_ft)
+        truth, scored = forecast_targets(part, fc.trip, fc.origin_step, fc.horizons, end_ft, include_arrived)
         parts.append(score_forecasts(fc.probs, centres, truth, scored, fc.horizons))
     return combine(parts)
 
 
 def constant_speed_scores(trips: list[TripObservations], speed_ftps: float, horizons: np.ndarray,
-                          end_ft: float) -> list[HorizonScore]:
+                          end_ft: float, include_arrived: bool = False) -> list[HorizonScore]:
     """Point forecasts: the last ping plus a constant speed, stopping at the end."""
     trip = np.concatenate([np.full(len(t.steps), b) for b, t in enumerate(trips)])
     origin = np.concatenate([t.steps for t in trips])
     y = np.concatenate([t.dist_ft for t in trips])
-    truth, scored = forecast_targets(trips, trip, origin, horizons, end_ft)
+    truth, scored = forecast_targets(trips, trip, origin, horizons, end_ft, include_arrived)
     pred = np.minimum(y[:, None] + speed_ftps * horizons[None], end_ft)
     out = []
     for k, h in enumerate(horizons):
@@ -138,6 +139,9 @@ def main() -> None:
     parser.add_argument("--min-share", type=float, default=0.2,
                         help="Drop horizons where fewer than this share of forecasts are scored (default: 0.2): "
                              "only positions still on the trip are, so the longest horizons are slow trips only")
+    parser.add_argument("--score-arrived", action="store_true",
+                        help="Also score buses that have reached the end, at the end (scoring only those still on "
+                             "the trip selects on the outcome, which favours forecasts that lag)")
     parser.add_argument("--horizon-step", type=int, default=15, help="Horizon spacing, s (default: 15)")
     parser.add_argument("--chunk", type=int, default=20, help="Trips forecast at once (memory)")
     parser.add_argument("--threads", type=int, help="torch CPU threads")
@@ -175,8 +179,9 @@ def main() -> None:
     with torch.no_grad():
         start.log_sigma.fill_(math.log(48.0))  # as simulation_study.py starts its fits
     sets["start (uninformed)"] = start
-    results = {name: model_scores(model, theta, trips, horizons, args.chunk) for name, theta in sets.items()}
-    results["constant speed"] = constant_speed_scores(trips, speed, horizons, end_ft)
+    results = {name: model_scores(model, theta, trips, horizons, args.chunk, args.score_arrived)
+               for name, theta in sets.items()}
+    results["constant speed"] = constant_speed_scores(trips, speed, horizons, end_ft, args.score_arrived)
     n_scored = np.array([s.n for s in results["truth"]])
     cut = int(np.argmax(n_scored < args.min_share * n_scored[0])) or len(horizons)
     horizons = horizons[:cut]

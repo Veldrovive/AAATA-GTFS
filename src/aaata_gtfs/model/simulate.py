@@ -237,10 +237,17 @@ class HorizonScore:
 
 def forecast_targets(
     trips: Sequence[TripObservations], trip: np.ndarray, origin_step: np.ndarray, horizons: np.ndarray, end_ft: float,
+    include_arrived: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """The true distance `[R, H]` at each forecast's origin + horizon, and
     whether it's scored: the bus hasn't reached the end of the route by then
-    (at or past it, where it is is trivial), and the simulation ran that long."""
+    (at or past it, where it is is trivial), and the simulation ran that long.
+
+    Which positions are scored then depends on the outcome, which favours
+    forecasts that lag (near the end, a good forecast puts mass on having
+    arrived). With `include_arrived`, a bus that has reached the end is scored
+    there (at `end_ft`, also after its simulation stops), so every forecast
+    from an origin is scored at every horizon."""
     truth = np.full((len(trip), len(horizons)), np.nan)
     for r, (b, n) in enumerate(zip(trip, origin_step)):
         true_ft = trips[b].true_dist_ft
@@ -249,6 +256,10 @@ def forecast_targets(
         steps = n + horizons
         ok = steps < len(true_ft)
         truth[r, ok] = true_ft[steps[ok]]
+        if include_arrived and true_ft[-1] >= end_ft:
+            truth[r, ~ok] = end_ft
+    if include_arrived:
+        return np.minimum(truth, end_ft), np.isfinite(truth)
     return truth, np.isfinite(truth) & (truth < end_ft)
 
 

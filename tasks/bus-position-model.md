@@ -169,14 +169,28 @@ dwell lengths, and the noise are recovered; the **probabilities P(red) and P(sto
 barely moved from 1/2**, and speeds on short segments aren't learnt. With a ping every
 ~30 s, whether a bus stopped at an element is latent, and a short or rare wait can be
 traded against a slower segment. The expected delay per pass (P × mean wait, now
-reported) is probably what's identified. Next: several seeds and more trips (does the
-error fall like 1/√n?), a full-length route, and Fisher-information standard errors to
-tell weak identification from a fitting problem. How to run these: [simulation-study.md](simulation-study.md).
-Partial results there (five seeds; 40–160 trips; Fisher; a forecast trial) suggest P(red)
-and P(stop) are data-limited (RMSE ∝ n^−0.6, Fisher SEs match the errors) rather than
-unidentified, and the 40-trip fit forecasts positions as well as the true parameters. Pooling (shared or hierarchical
-parameters across elements) would be the remedy if it's identification, but that's a
-modelling decision for the user.
+reported) is probably what's identified.
+
+The full study ([simulation-study.md](simulation-study.md): five seeds at 40 trips, seed
+0 at 40–320 trips, an 8 mi route, Fisher standard errors, forecasts) settles it:
+
+- **P(red) and P(stop) are identified, but weakly.** Their errors and Fisher SEs fall
+  like 1/√n, and the SEs match the errors from 80 trips on, but at 320 trips they're
+  still ±0.04–0.07 per element. The expected delay per pass is pinned down much better
+  (stop delay ±0.6 s at 320 trips); the P–wait split is partly confounded, by an amount
+  that varies by element and sample, not with anything visible in the truth or layout.
+- Speeds, waits, dwells and σ are recovered, and the error falls faster than 1/√n.
+  Short-segment speeds need more trips. The 8 mi route behaves like the 2 mi one per
+  element.
+- **Forecasts don't suffer.** From 40 trips on, the fitted parameters forecast positions
+  as well as the true ones (within 0–6% at every horizon, up to 35 min ahead on 8 mi)
+  and clearly better than constant speed (18–30% at 4 min on 2 mi); the 80% intervals
+  cover 0.86–0.93.
+
+So pooling P(stop) / P(red) across elements (shared, or hierarchical / ridge towards a
+route-level mean) or reparameterising by expected delay would only matter for reporting
+the probabilities themselves. That's a modelling decision for the user, still to be
+discussed.
 
 ## Order of work
 
