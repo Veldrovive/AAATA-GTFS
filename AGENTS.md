@@ -108,6 +108,9 @@ flags every consumer must check.
   §10); `conftest.py` has the shared fixtures (`static_conn`, `store`, `loaded_store`,
   `with_header` to make a "next refresh" of a fixture). `test_live.py` is marked `live`
   and skipped by default (`uv run pytest -m live`).
+- `tasks/` — design notes for planned work, referenced from SPEC.md.
+  `bus-position-model.md` is the agreed Phase 2 model design; keep it current as
+  decisions change.
 - `data/` — collected data (gitignored).
 - `Dockerfile`, `docker-compose.yml`, `docker-entrypoint.sh`, `.dockerignore` — the
   containerized collector, running as the host user.

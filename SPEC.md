@@ -1033,6 +1033,8 @@ check.
    `fix_ts` and the true time directly, which settles whether `fix_ts` is the GPS fix time
    or the server's receive time.
 5. **Segment speeds and travel-time distributions** (port `segments.py`), as features for a
-   probabilistic arrival-time model.
+   probabilistic arrival-time model. The agreed design for that model (a discretised HMM
+   over road segments, traffic lights and stops, fitted by gradient MLE in PyTorch) is in
+   [tasks/bus-position-model.md](tasks/bus-position-model.md).
 6. Visualizations: trip time–distance plots, ride lag plots and segment speed maps, ported
    from the old `visualization/` package.
