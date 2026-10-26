@@ -6,7 +6,9 @@ import pytest
 from aaata_gtfs.model.chain import NO_HOLD, ReferenceChain, State, default_params
 from aaata_gtfs.model.data import TripObservations, make_batch
 from aaata_gtfs.model.layout import Layout, build_layout
-from aaata_gtfs.model.simulate import Error, recovery_errors, simulate_trips, straight_geometry
+from aaata_gtfs.model.simulate import (
+    Error, random_params, recovery_errors, segment_speeds_mph, simulate_trips, straight_geometry,
+)
 from aaata_gtfs.osm import LightPosition
 
 def tiny_layout() -> Layout:
@@ -218,3 +220,14 @@ def test_recovery_errors() -> None:
     errors = recovery_errors(true, true, layout)
     assert all(e.rmse == 0 for e in errors.values() if e.n)
     assert Error.of(np.array([1.0, 3.0]), np.array([0.0, 0.0])) == Error(float(np.sqrt(5)), 2.0, 2.0, 2)
+
+
+def test_random_params_hit_slow_and_fast_speeds() -> None:
+    # Slow segments (a few ft/s) are mostly halts, not 25 ft hops every second.
+    layout = build_layout(straight_geometry(490.0, [0.0, 160.0, 489.0]), [], cell_ft=25.0, max_advance=3)
+    rng = np.random.default_rng(0)
+    for mph in (2.0, 3.4, 8.0, 20.0, 40.0):
+        params = random_params(layout, rng, n_phases=3, speed_mph=(mph, mph))
+        assert np.all(params.move_probs >= 0)
+        assert np.allclose(params.move_probs.sum(1), 1)
+        assert np.allclose(segment_speeds_mph(params, layout), mph)

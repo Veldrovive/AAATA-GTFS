@@ -85,6 +85,10 @@ With 400 evaluations, expect up to ~2.6× the fit times above.
 
 ## Results so far (M2 Pro, 150 evaluations, before it was stopped)
 
+These ran with the old speed generator, whose segments were all ~16–55 mph (see
+bus-position-model.md, "Parameter recovery"); a rerun covers 2–40 mph, slow traffic
+included.
+
 The 2 mi route has 424 cells, 8 stops, 5 lights and 14 segments. Each fit ran 152–156
 evaluations, so it hit the cap. Its training log-likelihood was above the truth's every
 time (e.g. seed 0: −6.052 vs −6.101), so the fits are near an optimum but not certainly
