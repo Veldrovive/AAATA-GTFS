@@ -171,7 +171,7 @@ barely moved from 1/2**, and speeds on short segments aren't learnt. With a ping
 traded against a slower segment. The expected delay per pass (P × mean wait, now
 reported) is probably what's identified. Next: several seeds and more trips (does the
 error fall like 1/√n?), a full-length route, and Fisher-information standard errors to
-tell weak identification from a fitting problem. Pooling (shared or hierarchical
+tell weak identification from a fitting problem. How to run these: [simulation-study.md](simulation-study.md). Pooling (shared or hierarchical
 parameters across elements) would be the remedy if it's identification, but that's a
 modelling decision for the user.
 

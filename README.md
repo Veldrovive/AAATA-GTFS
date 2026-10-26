@@ -103,6 +103,9 @@ and open the printed URL.
   query) into `data/blobs/osm/signals/`. Run it rarely, by hand.
 - `scripts/fit_shape.py`: fits the bus position model (tasks/bus-position-model.md) to one
   shape's trajectories by maximum likelihood. Needs `uv sync --extra model` (PyTorch).
+- `scripts/simulation_study.py`: simulates trips from known parameters, fits them, and
+  reports how well each parameter is recovered. See tasks/simulation-study.md for the full
+  study (best run on a fast machine).
 
 Signal data © OpenStreetMap contributors (ODbL).
 

@@ -113,7 +113,9 @@ stages rather than flags every consumer must check.
     `ReferenceChain`: the readable state-by-state definition, simulator and dense exact
     likelihood), `data.py` (`TripObservations`, `make_batch`, `by_layout`), `forward.py`
     (torch `Parameters`, `ForwardModel.log_likelihood` batched over trips sharing a
-    layout), `fit.py` (`fit_adam`, `fit_lbfgs`, `mean_log_likelihood`). `forward` and `fit`
+    layout), `fit.py` (`fit_adam`, `fit_lbfgs`, `mean_log_likelihood`), `simulate.py`
+    (`synthetic_layout`, `random_params`, `simulate_trips`, `recovery_errors` in physical
+    units). `forward` and `fit`
     need torch (the `model` extra); the rest only numpy. **`forward.py` must agree with
     `ReferenceChain`**: change both together; `test_model.py` checks they match.
   - `visualization/` — `data.py`: `BusPath` (route None = not in service),
@@ -129,7 +131,8 @@ stages rather than flags every consumer must check.
 - `scripts/` — `collect.py`, `plot_route_paths.py`, `collector_status.py`,
   `compare_with_old.py`, `check_geometry.py`, `check_trips.py` (reconstruction summary and
   agency cross-check), `fetch_osm_signals.py` (run rarely, by hand; writes a blob),
-  `fit_shape.py` (fits the model to one shape; needs the `model` extra); run with
+  `fit_shape.py` (fits the model to one shape) and `simulation_study.py` (parameter
+  recovery on simulated trips; tasks/simulation-study.md), both needing the `model` extra; run with
   `uv run scripts/<name>.py`. All take `--data-path`. Everything except `collect.py` and
   `fetch_osm_signals.py` opens the DB read-only (and that one only writes the blob).
 - `tests/` — offline pytest suite over real captures in `tests/fixtures/` (see SPEC.md
@@ -139,6 +142,8 @@ stages rather than flags every consumer must check.
 - `tasks/` — design notes for planned work, referenced from SPEC.md.
   `bus-position-model.md` is the agreed Phase 2 model design, with the implementation
   choices made so far; keep it current as decisions change.
+  `simulation-study.md` is how to run the parameter-recovery study on a fast machine,
+  and what to do with the results.
 - `data/` — collected data (gitignored).
 - `Dockerfile`, `docker-compose.yml`, `docker-entrypoint.sh`, `.dockerignore` — the
   containerized collector, running as the host user.
