@@ -9,15 +9,17 @@ the project changes: new modules, conventions, and anything learned about the fe
 feeds (vehicle positions, trip updates with trip modifications and shapes, alerts), the
 static GTFS feed, and BusTime's `getroutebyid` (as a cross-reference) into **one SQLite
 database plus a raw blob store**, never storing a duplicate when nothing changed. It also
-has linear referencing on GTFS shapes, a folium route map, and operational scripts. It
-replaces the sibling project `../AAATA-Bus-API` (`aaata_bus`), which polls BusTime's
+has linear referencing on GTFS shapes, a folium route map, operational scripts, and (Phase
+2, in progress) trip reconstruction and a statistical model of bus positions. It replaces the sibling project `../AAATA-Bus-API` (`aaata_bus`), which polls BusTime's
 website proxy; the two run in parallel for a while (`scripts/compare_with_old.py`).
 
-[SPEC.md](SPEC.md) is the full design. Phase 1 (this code) is the collector, storage,
-geometry and map. Phase 2 (trip reconstruction, observed arrivals, prediction accuracy,
-models) is outlined at the end of SPEC.md: **discuss modelling decisions with the user
-before implementing any model**, and clean data in explicit filtering stages rather than
-flags every consumer must check.
+[SPEC.md](SPEC.md) is the full design. Phase 1 is the collector, storage, geometry and
+map. Phase 2 (trip reconstruction, observed arrivals, prediction accuracy, models) is
+outlined at the end of SPEC.md; trip reconstruction, observed stop crossings and the first
+version of the bus position model
+([tasks/bus-position-model.md](tasks/bus-position-model.md)) exist. **Discuss modelling
+decisions with the user before implementing them**, and clean data in explicit filtering
+stages rather than flags every consumer must check.
 
 ## Layout
 
@@ -25,10 +27,11 @@ flags every consumer must check.
   - `config.py` — feed URLs, `USER_AGENT` / `REQUEST_HEADERS`, `DATA_PATH` (from
     `AAATA_GTFS_DATA_PATH`, default `<repo>/data`), `db_path()` / `blob_path()` for a
     given data path, `ensure_data_dir()` (creates it), polling constants, `LOCAL_TZ`
-    (America/Detroit), and `THERIDE_CREDIT` (required attribution).
+    (America/Detroit), `THERIDE_CREDIT` (required attribution) and `OVERPASS_URL`.
   - `http.py` — `make_client()` (the one shared `httpx.AsyncClient`; takes a
     `transport` for tests), `get()` (sends `REQUEST_HEADERS` per request, raises on 4xx/5xx
-    but not 304), `get_bytes()`, `backoff_delay(n)` (5, 10, 20 … 120 s).
+    but not 304; `timeout_s` overrides the client's 20 s), `get_bytes()`,
+    `backoff_delay(n)` (5, 10, 20 … 120 s).
   - `db.py` — `connect(path, read_only=False)` with the pragmas (WAL, `synchronous=NORMAL`,
     foreign keys, `busy_timeout`), `migrate()` over `MIGRATIONS` using `PRAGMA
     user_version`, `open_db()`, and `TABLES`. Migration 1 is the schema in SPEC.md §4.3
@@ -36,8 +39,8 @@ flags every consumer must check.
     migrations; never edit a shipped one.**
   - `filestore.py` — raw blobs under `<data>/blobs/`: `append_rt` / `iter_rt` for hourly
     RT files of appended gzip members (8-byte BE header_ts, 4-byte BE length, payload),
-    `put_static`, `put_bustime` (gzipped, named by canonical hash), `read_blob`. Paths in
-    the DB are relative to the data path.
+    `put_static`, `put_bustime` (gzipped, named by canonical hash), `read_blob`,
+    `write_once` (atomic; never overwrites). Paths in the DB are relative to the data path.
   - `realtime.py` — pure protobuf → frozen dataclasses: `VehicleRecord`,
     `TripUpdateRecord` (+ `StopTimeRecord`s), `TripModificationsRecord`, `RtShapeRecord`,
     `AlertRecord`; `parse_feed`, `header_ts`, `content_sha256` (entities only, header
@@ -76,7 +79,9 @@ flags every consumer must check.
     shape_id=None)`, ported from the old `PatternGeometry`: stops attach to the first
     vertex at or after the previous stop's within tolerance (1 ft static, 6 ft RT), stop
     spurs are cut, then `project` / `project_many` (chunked by 2,000 points) /
-    `point_at` / `path_between` / `stop_distances` / `agency_dist_ft`. `snap_sightings`
+    `project_passes` (one projection per pass within a distance) / `point_at` /
+    `path_between` / `stop_distances` / `agency_dist_ft`. With a `near_ft` hint, only
+    passes within `PASS_OFFSET_SLACK_FT` (60 ft) of the closest compete. `snap_sightings`
     projects one vehicle's time-ordered positions near the previous on-route one on the
     same geometry `key`. `Sighting` and `GeometrySource` are the protocols it needs.
   - `shapes.py` — `GeometryResolver(conn, static, data_path)`: `for_trip(trip_id,
@@ -91,6 +96,26 @@ flags every consumer must check.
     `predictions_at`, `snapshot_near`, `all_trip_modifications` /
     `trip_modifications_at`, `all_rt_shapes` / `rt_shape_at`, `bustime_route_versions`.
     RT entities are in effect from their first snapshot − 60 s to their last + 60 s.
+  - `trips.py` — trip reconstruction in filtering stages (see its docstring): `Sighting`s
+    (`load_sightings`) and `TripAssignments` (the trips feed's current trip per vehicle,
+    `load_assignments`) → `reconstruct` / `reconstruct_from_db` → `Reconstruction`
+    (`Trajectory`s of `TripPing`s with the `removed` pings and reasons, plus counts of
+    trajectories `dropped` whole). `stop_crossings` (arrival / passed / departure at each
+    stop, from the isotonic fit) and `agency_stop_passed` (when the trip updates stopped
+    listing each stop).
+  - `osm.py` — traffic signals from OpenStreetMap: `fetch_signals` (one Overpass query),
+    `put_signals` / `latest_signals_blob` / `load_signals` (dated blobs under
+    `blobs/osm/signals/`), `parse_signals`, and `lights_on_shape` (snapped to every pass
+    within 60 ft, merged within 150 ft) → `LightPosition`s. Credit `OSM_CREDIT` on displays.
+  - `model/` — the bus position model (see its `__init__` docstring and
+    tasks/bus-position-model.md): `layout.py` (`Layout`, `build_layout`: cells and
+    stop/light elements), `chain.py` (`ModelParams`, `default_params`, `State`, and
+    `ReferenceChain`: the readable state-by-state definition, simulator and dense exact
+    likelihood), `data.py` (`TripObservations`, `make_batch`, `by_layout`), `forward.py`
+    (torch `Parameters`, `ForwardModel.log_likelihood` batched over trips sharing a
+    layout), `fit.py` (`fit_adam`, `fit_lbfgs`, `mean_log_likelihood`). `forward` and `fit`
+    need torch (the `model` extra); the rest only numpy. **`forward.py` must agree with
+    `ReferenceChain`**: change both together; `test_model.py` checks they match.
   - `visualization/` — `data.py`: `BusPath` (route None = not in service),
     `trace_bus_paths` (split on route change or gap), `latest_positions`
     (`LatestPosition` with `age_s`). `route_paths.py`: `route_drawings` (static shapes of
@@ -102,23 +127,29 @@ flags every consumer must check.
     attribution). `serve.py`: localhost server for `--serve`.
   - `__init__.py` — re-exports the public API; **keep `__all__` current**.
 - `scripts/` — `collect.py`, `plot_route_paths.py`, `collector_status.py`,
-  `compare_with_old.py`, `check_geometry.py`; run with `uv run scripts/<name>.py`. All
-  take `--data-path`. Everything except `collect.py` opens the DB read-only.
+  `compare_with_old.py`, `check_geometry.py`, `check_trips.py` (reconstruction summary and
+  agency cross-check), `fetch_osm_signals.py` (run rarely, by hand; writes a blob),
+  `fit_shape.py` (fits the model to one shape; needs the `model` extra); run with
+  `uv run scripts/<name>.py`. All take `--data-path`. Everything except `collect.py` and
+  `fetch_osm_signals.py` opens the DB read-only (and that one only writes the blob).
 - `tests/` — offline pytest suite over real captures in `tests/fixtures/` (see SPEC.md
-  §10); `conftest.py` has the shared fixtures (`static_conn`, `store`, `loaded_store`,
+  §10) and synthetic positions along fixture shapes (`test_trips.py`); `conftest.py` has the shared fixtures (`static_conn`, `store`, `loaded_store`,
   `with_header` to make a "next refresh" of a fixture). `test_live.py` is marked `live`
   and skipped by default (`uv run pytest -m live`).
 - `tasks/` — design notes for planned work, referenced from SPEC.md.
-  `bus-position-model.md` is the agreed Phase 2 model design; keep it current as
-  decisions change.
+  `bus-position-model.md` is the agreed Phase 2 model design, with the implementation
+  choices made so far; keep it current as decisions change.
 - `data/` — collected data (gitignored).
 - `Dockerfile`, `docker-compose.yml`, `docker-entrypoint.sh`, `.dockerignore` — the
   containerized collector, running as the host user.
 
 ## Workflow
 
-Dependencies are managed with **uv** (Python ≥ 3.13). `uv sync` installs everything,
-including the dev group (pytest, pyrefly).
+Dependencies are managed with **uv** (Python ≥ 3.13). `uv sync --extra model` installs
+everything: the dev group (pytest, pyrefly) and torch for the model (without it, the torch
+tests are skipped). torch is an optional extra so the collector's Docker image
+(`uv sync --frozen`, no extras) stays small; on Linux aarch64 (the Pi) it comes from
+PyTorch's CPU-only index, because PyPI's aarch64 wheels pull in CUDA.
 
 After making changes, always run both and fix anything you introduced:
 
@@ -215,5 +246,19 @@ rather than pytest-asyncio.
   read-only and unexported; set both in `.env`), so `./data` stays owned by the host user.
   Create `./data` before the first `up`, or Docker creates it as root. The entrypoint runs
   the venv's python directly (not `uv run`, which needs a writable cache).
+- **Trip boundaries:** the trips feed often moves a bus to its next trip while it's still
+  approaching the terminus of the last one (and drops the finished trip), while the vehicle
+  feed keeps the old trip id for a few fixes after departure. `trips._label` only moves a
+  position to the trips feed's trip once the bus has been at that trip's start, and never
+  moves the arrival at the end of the reported trip.
+- **Deadheading under a trip id:** buses sometimes report a trip while driving its route
+  backwards to the start, or run part of it, turn back and run it again. The first is cut
+  (`before_restart`); the second is ambiguous and dropped (`restart`). The agency's trip
+  updates treat the first run as the trip.
+- The trips feed stops listing a trip's **first stop** before the bus leaves it; other stops
+  drop out a median ~15 s after our interpolated departure (the ~30 s feed cadence).
+- **OSM signals:** a signalised intersection is ~3 nodes (per approach or carriageway, plus
+  crossings), hence the merge in `lights_on_shape`. The Overpass main instance can 502 or
+  take over 20 s; retry once, politely, with the longer timeout.
 - Displays of the data must credit: "Transit scheduling, geographic, and real-time data
   provided by permission of AAATA/TheRide" (`THERIDE_CREDIT`).

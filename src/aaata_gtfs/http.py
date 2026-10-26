@@ -18,12 +18,19 @@ def make_client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.Asyn
     )
 
 
-async def get(client: httpx.AsyncClient, url: str, headers: dict[str, str] | None = None) -> httpx.Response:
+async def get(
+    client: httpx.AsyncClient, url: str, headers: dict[str, str] | None = None, timeout_s: float | None = None
+) -> httpx.Response:
     """GET `url`, raising `httpx.HTTPStatusError` for a 4xx/5xx response (but not 304).
 
-    `REQUEST_HEADERS` are sent per request too, so a caller's own client identifies us.
+    `REQUEST_HEADERS` are sent per request too, so a caller's own client
+    identifies us. `timeout_s` overrides the client's timeout for slow servers.
     """
-    response = await client.get(url, headers={**REQUEST_HEADERS, **(headers or {})})
+    merged = {**REQUEST_HEADERS, **(headers or {})}
+    if timeout_s is None:
+        response = await client.get(url, headers=merged)
+    else:
+        response = await client.get(url, headers=merged, timeout=timeout_s)
     if response.status_code != 304:
         response.raise_for_status()
     return response

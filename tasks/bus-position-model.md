@@ -1,9 +1,11 @@
 # Bus position model (Phase 2)
 
 Design notes for a generative statistical model of bus positions, fitted by maximum
-likelihood. Status: **agreed direction, not implemented**. Referenced from SPEC.md §14.
-Decisions here were made in discussion with the user (2026-10-25); change them the same
-way.
+likelihood. Status: **first version implemented** (`aaata_gtfs.model`, 2026-10-25): steps
+1–4 of the order of work, plus a smoke-test fit (step 5 needs weeks of data). Referenced
+from SPEC.md §14. Decisions here were made in discussion with the user (2026-10-25);
+change them the same way. The choices made while implementing, within the agreed design,
+are under "Implementation (v1)" for review.
 
 ## Goal
 
@@ -97,23 +99,68 @@ at first.
   per route), but a small simulator from the same generative model is handy for testing
   the fitting code.
 
+## Implementation (v1)
+
+Code: `trips.py` (clean trajectories), `osm.py` (signals), and `model/`: `layout.py`
+(cells and elements), `chain.py` (the chain state by state: the reference definition,
+simulator and dense likelihood), `forward.py` (the batched torch forward pass), `data.py`
+(trajectories to observation batches), `fit.py` (Adam / L-BFGS). Tests check the torch
+forward pass against the dense reference to 1e-9, the simulator against the propagated
+chain, and that MLE on simulated trips beats the true parameters' likelihood and recovers
+segment speeds and the noise scale. `scripts/fit_shape.py` fits one real shape.
+
+Choices made while implementing (open to change):
+
+- **Movement within a segment:** each 1 s step the bus advances 0…K cells (K = 3, i.e. up
+  to 75 ft/s with 25 ft cells) with a categorical distribution per segment (softmax of
+  K + 1 logits). Traversal time is then a discrete phase-type distribution, but the steps
+  are i.i.d., so there's no persistent speed state: a segment's time varies less than
+  real traffic might. Stopping in traffic is the `j = 0` advance. A move that would cross
+  an element stops at its cell (the arrival), so up to 1 s is lost at each element.
+  Adding a small latent speed regime (free / slow, with persistence) is the obvious
+  extension if residuals show overdispersion.
+- **Phase-type waits and dwells:** P = 8 phases with one exit probability `q` per element
+  and an entry distribution `π` over phases (a mixture of negative binomials with a
+  common rate). Minimum wait 1 s.
+- **Holds:** every non-final stop can hold; it does if `stop_times.timepoint = 1` and the
+  bus is ready before the scheduled departure (`sched_steps`, per trip). A hold state per
+  stop releases deterministically at the scheduled step.
+- **Elements:** the last stop isn't an element (reaching the end cell ends the trip;
+  the end cell is absorbing, so layover pings there are explained). At most one element
+  per cell: a collision moves the later one to the next cell, else drops it.
+- **Lights** (`osm.py`): `highway=traffic_signals` and signalised crossings
+  (`crossing=traffic_signals`), snapped to every pass of the shape within 60 ft and merged
+  when within 150 ft along it (OSM maps a signal as ~3 nodes). 2–5 lights per mile on
+  the routes checked; a quarter to a third of lights are within 150 ft of a stop.
+- **Observation model:** raw projected distance (not the isotonic fit) ~
+  `(1 − ε) N(cell centre, σ) + ε U(0, L)`, with σ ≥ 2 ft and ε learnt.
+- **Likelihood:** conditional on each trip's first observation, with a uniform prior over
+  cells (moving, or held at an early timepoint) at the first fix. So the first ping's
+  position carries no information, and the hold at a trip's first stop is only learnt
+  from trips observed before departure.
+- **Numerics:** float64, normalising only at observation steps (transitions conserve
+  mass exactly). On the Pi, one route-4 shape (1,816 cells, 38 lights, 34 stops), 3 trips
+  over 2,787 steps: forward 3.1 s, backward 3.6 s, ~1.2 GB peak (≈ 300 MB per trip-hour,
+  as estimated). Checkpointing or Fisher's identity aren't needed yet.
+
 ## Order of work
 
-1. SPEC.md §14 items 1–2: clean trip trajectories against fix time.
-2. Signal inventory per route from OSM, snapped to shapes; sanity-check against where
-   clean trajectories stop away from bus stops.
-3. Element sequence per shape (segments, lights, stops, timepoints) and the state space.
-4. Forward pass in PyTorch; check it against a brute-force likelihood on a tiny route and
-   against simulated data.
+1. ✅ SPEC.md §14 items 1–2: clean trip trajectories against fix time.
+2. ✅ Signal inventory per route from OSM, snapped to shapes. Still to do, once there's
+   more data: sanity-check against where clean trajectories stop away from bus stops.
+3. ✅ Element sequence per shape (segments, lights, stops, timepoints) and the state space.
+4. ✅ Forward pass in PyTorch; checked against the dense reference likelihood on a tiny
+   route and against simulated data.
 5. Fit one route, no covariates; compare simulated and observed distributions (time
-   between pings, dwell lengths, time stopped at lights).
+   between pings, dwell lengths, time stopped at lights). The fitting code and a smoke
+   test exist (`scripts/fit_shape.py`); a real fit waits for a few weeks of data.
 6. Covariates and regularisation; then the deferred items if the residuals call for them.
 7. Arrival prediction: condition the forward pass on the observations so far and roll
    forward; evaluate on held-out days against the agency baseline.
 
 ## Open questions
 
-- Cell size and time step (25 ft / 1 s is a starting guess).
+- Cell size and time step (25 ft / 1 s is a starting guess; `CELL_FT`, `MAX_ADVANCE`).
 - Phase counts per distribution type, and whether they are fixed or chosen by held-out
   likelihood.
 - Train/test split (by day, presumably) and the evaluation metrics for arrival prediction.

@@ -1012,20 +1012,22 @@ instead of failing when there are no vehicles (overnight).
 
 ---
 
-## 14. Phase 2 (outline only; do not build yet)
+## 14. Phase 2 (in progress)
 
 Discuss modelling decisions (labels, train/test splits, baselines, evaluation) with the
 user before implementing any model. Clean data in explicit **filtering stages** that
 output clean records, rather than adding flags that every consumer has to remember to
 check.
 
-1. **Trip reconstruction:** port `trips.py`, but trips come from `trip_id` + `service_date`
-   directly, so no majority vote is needed. Handle stale trip ids at trip boundaries (use
-   the trip-updates feed's vehicle assignment and progress along the shape). Fit distance
-   along the shape with isotonic regression, against **fix time** instead of poll time.
-   Filter stale repeats and backward jumps in a stage.
-2. **Observed stop arrivals:** interpolate each trip's distance-vs-fix-time to every stop's
-   distance. Cross-check against the time `first_stop_sequence` passed the stop (§4.3.3).
+1. **Trip reconstruction** (done: `trips.py`, checked by `scripts/check_trips.py`): trips
+   come from `trip_id` + `service_date` directly, so no majority vote is needed. Stale trip
+   ids at trip boundaries are fixed from the trip-updates feed's vehicle assignment and
+   progress along the shape. Distance along the shape is fitted with isotonic regression
+   against **fix time**. Detours, off-route runs, stale repeats, backward jumps and
+   pre-trip approaches are removed in stages.
+2. **Observed stop arrivals** (done: `trips.stop_crossings`): each trip's distance-vs-fix-time
+   is interpolated to every stop's distance, and cross-checked against the time
+   `first_stop_sequence` passed the stop (`trips.agency_stop_passed`, §4.3.3).
 3. **Agency prediction accuracy:** compare `stop_time_prediction` (as of each observation
    time and lead time) with the observed arrivals. This is the baseline any model has to
    beat.
@@ -1035,6 +1037,7 @@ check.
 5. **Segment speeds and travel-time distributions** (port `segments.py`), as features for a
    probabilistic arrival-time model. The agreed design for that model (a discretised HMM
    over road segments, traffic lights and stops, fitted by gradient MLE in PyTorch) is in
-   [tasks/bus-position-model.md](tasks/bus-position-model.md).
+   [tasks/bus-position-model.md](tasks/bus-position-model.md); the first version is in
+   `aaata_gtfs.model`, with traffic signals from OSM (`osm.py`).
 6. Visualizations: trip time–distance plots, ride lag plots and segment speed maps, ported
    from the old `visualization/` package.

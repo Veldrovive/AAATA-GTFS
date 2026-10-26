@@ -28,6 +28,8 @@ ALERTS_URL = "https://rt.theride.org/gtfsrt/alerts"
 RT_FEED_URLS = {"vehicles": VEHICLES_URL, "trips": TRIPS_URL, "alerts": ALERTS_URL}
 STATIC_URL = "https://www.theride.org/sites/default/files/google/google_transit.zip"
 GETROUTEBYID_URL = "https://www.theride.org/api/ServiceData?method=getroutebyid&routeid={route_id}"
+#: OpenStreetMap's Overpass API, queried rarely and by hand for traffic signals (`osm.py`).
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 #: The vehicles and trips feeds regenerate about this often, together.
 REFRESH_S = 30.0

@@ -46,6 +46,10 @@ SPUR_RETURN_TOLERANCE_FT = 3.0
 STATIC_STOP_TOLERANCE_FT = 1.0
 RT_STOP_TOLERANCE_FT = 6.0
 
+#: With a `near_ft` hint, passes of the path more than this much further from
+#: the point than the closest pass are ignored (see `_nearest_pass`).
+PASS_OFFSET_SLACK_FT = 60.0
+
 #: `project_many` works in chunks of this many points to bound memory.
 PROJECT_CHUNK = 2000
 
@@ -318,12 +322,15 @@ class ShapeGeometry:
         A pass is a contiguous run of segments within `max_offset_ft` of the
         point; each is represented by its closest segment. Picking among passes
         rather than segments keeps the hint from dragging the snap along the
-        pass the point is actually on.
+        pass the point is actually on. Only passes within `PASS_OFFSET_SLACK_FT`
+        of the closest are considered: both directions of a street qualify,
+        but not a street around the corner that the point isn't on.
         """
         close = offset <= max(max_offset_ft, offset[best])
         # Boundaries of each contiguous run of close segments.
         edges = np.flatnonzero(np.diff(np.concatenate([[0], close.astype(np.int8), [0]])))
         passes = [start + int(offset[start:end].argmin()) for start, end in zip(edges[::2], edges[1::2])]
+        passes = [j for j in passes if offset[j] <= offset[best] + PASS_OFFSET_SLACK_FT]
         return min(passes, key=lambda j: abs(along[j] - near))
 
     def project(
@@ -349,6 +356,24 @@ class ShapeGeometry:
             `DEFAULT_MAX_OFFSET_FT` to reject off-path points.
         """
         return self.project_many([lat], [lon], [near_ft], max_offset_ft)[0]
+
+    def project_passes(self, lat: float, lon: float, max_offset_ft: float) -> list[Projection]:
+        """The projection onto each pass of the path within `max_offset_ft` of a
+        point (a path through an intersection twice has two), in path order."""
+        xy = self._to_xy(np.array([lat]), np.array([lon]))
+        rel = xy[:, None, :] - self._seg_start[None, :, :]
+        t = np.clip((rel * self._seg_vec).sum(-1) / self._seg_len2, 0.0, 1.0)[0]
+        foot = self._seg_start + t[:, None] * self._seg_vec
+        offset = np.hypot(*(xy[0] - foot).T)
+        along = self._seg_dist0 + t * np.sqrt(self._seg_len2)
+        close = offset <= max_offset_ft
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], close.astype(np.int8), [0]])))
+        out = []
+        for start, end in zip(edges[::2], edges[1::2]):
+            j = start + int(offset[start:end].argmin())
+            la, lo = self._to_latlon(foot[j])
+            out.append(Projection(float(along[j]), float(offset[j]), float(la), float(lo)))
+        return out
 
     def point_at(self, dist_along_ft: float) -> tuple[float, float]:
         """(lat, lon) of the point this far along the path (clamped to it)."""

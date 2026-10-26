@@ -55,7 +55,7 @@ def iter_rt(path: Path | str) -> Iterator[tuple[int, bytes]]:
             yield header_ts, payload
 
 
-def _write_once(path: Path, data: bytes) -> None:
+def write_once(path: Path, data: bytes) -> None:
     """Write `data` to `path` atomically, unless the file already exists."""
     if path.exists():
         return
@@ -71,7 +71,7 @@ def static_relpath(content_id: str) -> str:
 
 def put_static(content_id: str, zip_bytes: bytes, data_path: Path = DATA_PATH) -> str:
     relpath = static_relpath(content_id)
-    _write_once(data_path / relpath, zip_bytes)
+    write_once(data_path / relpath, zip_bytes)
     return relpath
 
 
@@ -82,7 +82,7 @@ def bustime_relpath(route_id: str, sha256: str) -> str:
 def put_bustime(route_id: str, sha256: str, payload: bytes, data_path: Path = DATA_PATH) -> str:
     """Store a getroutebyid response body (gzipped), named by its canonical hash."""
     relpath = bustime_relpath(route_id, sha256)
-    _write_once(data_path / relpath, gzip.compress(payload, mtime=0))
+    write_once(data_path / relpath, gzip.compress(payload, mtime=0))
     return relpath
 
 

@@ -94,6 +94,18 @@ and open the printed URL.
   `route_prediction_data.jsonl` (fix-time matching, coverage, BusTime pattern ↔ GTFS shape
   mapping, trip ids, predictions). Reads the old file without changing it.
 
+## Trips and the bus position model (Phase 2, in progress)
+
+- `scripts/check_trips.py`: rebuilds clean trip trajectories (distance along the shape
+  against GPS fix time) and reports what each filtering stage dropped, and how our
+  interpolated stop departures compare with the agency's trip updates.
+- `scripts/fetch_osm_signals.py`: fetches traffic signals from OpenStreetMap (one Overpass
+  query) into `data/blobs/osm/signals/`. Run it rarely, by hand.
+- `scripts/fit_shape.py`: fits the bus position model (tasks/bus-position-model.md) to one
+  shape's trajectories by maximum likelihood. Needs `uv sync --extra model` (PyTorch).
+
+Signal data © OpenStreetMap contributors (ODbL).
+
 ## Where the data lives
 
 Everything is under `data/` (gitignored; override with `--data-path` or
@@ -106,6 +118,7 @@ data/
     rt/<feed>/<YYYY>/<MM>/<DD>/<HH>.pbs.gz         # raw realtime payloads, one gzip member each
     static/<content_id>.zip                        # every static GTFS version
     bustime/getroutebyid/<route_id>/<sha12>.json.gz
+    osm/signals/<YYYYMMDDTHHMMSSZ>.json.gz         # OSM traffic signals (Overpass responses)
   route_paths.html                                 # the map, when made
 ```
 
@@ -132,7 +145,7 @@ Scripts open the DB read-only, so they can run while the collector writes.
 ## Development
 
 ```bash
-uv sync
+uv sync --extra model      # torch, for the model and its tests (skipped without it)
 uv run pyrefly check
 uv run pytest              # offline, against real captures in tests/fixtures/
 uv run pytest -m live      # also hits the real feeds
