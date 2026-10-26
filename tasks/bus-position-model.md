@@ -118,7 +118,10 @@ Choices made while implementing (open to change):
   real traffic might. Stopping in traffic is the `j = 0` advance. A move that would cross
   an element stops at its cell (the arrival), so up to 1 s is lost at each element.
   Adding a small latent speed regime (free / slow, with persistence) is the obvious
-  extension if residuals show overdispersion.
+  extension if residuals show overdispersion. Integer advances also tie a segment's
+  speed variance to its mean (a slow segment needs a large `j = 0` probability); the
+  planned fix is a continuous-position model:
+  [continuous-position-model.md](continuous-position-model.md).
 - **Phase-type waits and dwells:** P = 8 phases with one exit probability `q` per element
   and an entry distribution `π` over phases (a mixture of negative binomials with a
   common rate). Minimum wait 1 s.

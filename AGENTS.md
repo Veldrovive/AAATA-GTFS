@@ -150,6 +150,9 @@ stages rather than flags every consumer must check.
   `simulation-study.md` is how to run the parameter-recovery and forecast study on a
   big remote machine (it ran a 16 GB laptop out of memory), the results so far, and what
   to do with the full results.
+  `continuous-position-model.md` is the planned V1 of a continuous-position version of
+  the model (log-normal speeds, a queued mode, computed on a fine numerical grid), with
+  its open questions; settle those with the user before implementing it.
 - `data/` — collected data (gitignored).
 - `Dockerfile`, `docker-compose.yml`, `docker-entrypoint.sh`, `.dockerignore` — the
   containerized collector, running as the host user.

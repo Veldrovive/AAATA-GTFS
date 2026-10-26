@@ -1038,6 +1038,8 @@ check.
    probabilistic arrival-time model. The agreed design for that model (a discretised HMM
    over road segments, traffic lights and stops, fitted by gradient MLE in PyTorch) is in
    [tasks/bus-position-model.md](tasks/bus-position-model.md); the first version is in
-   `aaata_gtfs.model`, with traffic signals from OSM (`osm.py`).
+   `aaata_gtfs.model`, with traffic signals from OSM (`osm.py`). A planned
+   continuous-position version is in
+   [tasks/continuous-position-model.md](tasks/continuous-position-model.md).
 6. Visualizations: trip time–distance plots, ride lag plots and segment speed maps, ported
    from the old `visualization/` package.
