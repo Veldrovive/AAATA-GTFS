@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 # The bus position model (`aaata_gtfs.model`); not needed by the collector.
 model = [
+    "matplotlib>=3.11.2",
     "torch>=2.9",
 ]
 

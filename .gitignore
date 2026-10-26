@@ -12,3 +12,4 @@ wheels/
 # Collected data
 data/
 .env
+study/

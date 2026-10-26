@@ -128,6 +128,90 @@ def test_fit_recovers_simulated_parameters() -> None:
     assert abs(fitted.sigma_ft - true.sigma_ft) < 5
 
 
+def test_observed_information_matches_autograd_hessian() -> None:
+    torch = pytest.importorskip("torch")
+    from aaata_gtfs.model.fit import observed_information
+    from aaata_gtfs.model.forward import ForwardModel, Parameters
+
+    layout = tiny_layout()
+    trips = simulated_trips(layout, 3, 4, seed=4)
+    model = ForwardModel(layout)
+    params = Parameters(layout, n_phases=3).set_from(default_params(layout, n_phases=3, seed=3))
+    before = torch.nn.utils.parameters_to_vector(params.parameters()).detach().clone()
+    info = observed_information(model, params, trips)
+    assert torch.equal(torch.nn.utils.parameters_to_vector(params.parameters()).detach(), before)
+
+    # The exact Hessian by double backward.
+    leaves = list(params.parameters())
+    grads = torch.autograd.grad(model.log_likelihood(params, make_batch(trips)).sum(), leaves, create_graph=True)
+    flat = torch.cat([g.reshape(-1) for g in grads])
+    rows = [torch.cat([h.reshape(-1) for h in torch.autograd.grad(g, leaves, retain_graph=True)]) for g in flat]
+    exact = -torch.stack(rows).detach().numpy()
+    assert np.allclose(info, exact, rtol=1e-4, atol=1e-5 * np.abs(exact).max())
+
+
+def test_forecast_matches_reference() -> None:
+    """Position forecasts from every ping equal the dense chain filtered to the
+    ping and propagated without observations."""
+    pytest.importorskip("torch")
+    from aaata_gtfs.model.forward import ForwardModel, Parameters
+
+    layout = tiny_layout()
+    params = default_params(layout, n_phases=3, seed=7)
+    chain = ReferenceChain(layout, params)
+    trips = simulated_trips(layout, 7, 3, seed=8)
+    horizons = [0, 5, 17]
+    fc = ForwardModel(layout).forecast(Parameters(layout, n_phases=3).set_from(params), make_batch(trips), horizons)
+    assert fc.probs.shape == (sum(len(t.steps) for t in trips), 3, layout.n_cells)
+    assert np.allclose(fc.probs.sum(-1), 1)
+
+    cells = np.array([chain.cell(s) for s in chain.states])
+    for r, (b, n0) in enumerate(zip(fc.trip, fc.origin_step)):
+        t = trips[b]
+        alpha = chain.initial(t.sched_steps) * chain.obs_likelihood(t.dist_ft[0])
+        alpha /= alpha.sum()
+        n = 0
+        for step, y in zip(t.steps[1:], t.dist_ft[1:]):
+            if step > n0:
+                break
+            while n < step:
+                n += 1
+                alpha = alpha @ chain.transition_matrix(n, t.sched_steps)
+            alpha = alpha * chain.obs_likelihood(y)
+            alpha /= alpha.sum()
+        for k, h in enumerate(horizons):
+            ahead = alpha.copy()
+            for m in range(n0 + 1, n0 + h + 1):
+                ahead = ahead @ chain.transition_matrix(m, t.sched_steps)
+            expected = np.bincount(cells, weights=ahead, minlength=layout.n_cells)
+            assert np.allclose(fc.probs[r, k], expected, atol=1e-9)
+
+
+def test_score_forecasts() -> None:
+    from aaata_gtfs.model.simulate import forecast_targets, score_forecasts
+
+    centres = (np.arange(10) + 0.5) * 25.0
+    trips = [TripObservations(np.array([0, 4]), np.array([0.0, 60.0]), np.array([NO_HOLD]),
+                              true_dist_ft=centres[[0, 0, 1, 2, 3, 9, 9]])]
+    horizons = np.array([0, 2, 10])
+    truth, scored = forecast_targets(trips, np.array([0, 0]), np.array([0, 4]), horizons, centres[-1])
+    # From step 4: on route at +0, at the end at +2 (not scored), past the simulation at +10.
+    assert scored.tolist() == [[True, True, False], [True, False, False]]
+    assert truth[0, 1] == centres[1]
+
+    # A point mass on the truth scores perfectly; one two cells ahead is 50 ft off.
+    probs = np.zeros((2, 3, 10))
+    probs[0, 0, 0] = probs[0, 1, 1] = 1.0
+    probs[0, 2, 0] = 1.0  # not scored
+    probs[1, :, 5] = 1.0
+    scores = score_forecasts(probs, centres, truth, scored, horizons)
+    assert scores[0].n == 2 and scores[1].n == 1 and scores[2].n == 0
+    assert scores[1].median_abs_ft == 0 and scores[1].crps_ft == 0 and scores[1].coverage == 1
+    assert scores[0].median_abs_ft == pytest.approx((0 + 50) / 2)
+    assert scores[0].crps_ft == pytest.approx((0 + 50) / 2)  # a point forecast's CRPS is its error
+    assert scores[0].coverage == 0.5
+
+
 def test_recovery_errors() -> None:
     layout = tiny_layout()
     true = default_params(layout, n_phases=3, seed=1)

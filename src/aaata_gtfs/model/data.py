@@ -27,6 +27,8 @@ class TripObservations:
     trip_id: str | None = None
     service_date: str | None = None
     vehicle_id: str | None = None
+    #: Simulated trips only: the noise-free distance at every step.
+    true_dist_ft: np.ndarray | None = None
 
 
 def trip_observations(trajectory: Trajectory, layout: Layout, static: StaticGtfs) -> TripObservations:

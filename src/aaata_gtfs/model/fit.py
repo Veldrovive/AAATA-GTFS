@@ -81,3 +81,36 @@ def fit_lbfgs(
 
     optimizer.step(closure)  # pyrefly: ignore[bad-argument-type]
     return history
+
+
+def observed_information(
+    model: ForwardModel, params: Parameters, trips: Sequence[TripObservations], eps: float = 1e-5
+) -> np.ndarray:
+    """Minus the Hessian of the summed log-likelihood over the flattened raw
+    parameters (`parameters_to_vector` order), by central differences of the
+    exact gradient. Softmax logits are only defined up to a constant, so it is
+    singular along those directions: use a pseudo-inverse, and only for
+    functions of the constrained parameters. `params` is left unchanged."""
+    batch = make_batch(trips)
+    leaves = list(params.parameters())
+    centre = torch.nn.utils.parameters_to_vector(leaves).detach().clone()
+
+    def gradient(theta: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            torch.nn.utils.vector_to_parameters(theta, leaves)
+        params.zero_grad()
+        model.log_likelihood(params, batch).sum().backward()
+        return torch.cat([p.grad.reshape(-1) for p in leaves]).detach()  # pyrefly: ignore[missing-attribute]
+
+    n = centre.numel()
+    hessian = np.zeros((n, n))
+    try:
+        for i in range(n):
+            step = torch.zeros_like(centre)
+            step[i] = eps
+            hessian[i] = ((gradient(centre + step) - gradient(centre - step)) / (2 * eps)).numpy()
+    finally:
+        with torch.no_grad():
+            torch.nn.utils.vector_to_parameters(centre, leaves)
+        params.zero_grad()
+    return -(hessian + hessian.T) / 2

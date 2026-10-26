@@ -16,6 +16,8 @@ the exact `log p(y_1 … y_m | y_0)`.
 """
 
 import math
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -93,6 +95,16 @@ class Parameters(nn.Module):
         return self
 
 
+@dataclass(frozen=True)
+class Forecast:
+    """Position forecasts, one row per (trip, observation) origin."""
+
+    trip: np.ndarray  # [R] the trip's index in the batch
+    origin_step: np.ndarray  # [R] the observed step each forecast is made from
+    horizons: np.ndarray  # [H] steps ahead
+    probs: np.ndarray  # [R, H, n_cells] the distribution over cells at origin + horizon
+
+
 class ForwardModel:
     """The forward pass for one layout (index tables precomputed)."""
 
@@ -127,9 +139,15 @@ class ForwardModel:
         end[0] = 1.0
         self._end_row = end  # the end cell stays put
 
-    def _move_weights(self, p: dict[str, Tensor]) -> Tensor:
+    def _kernel(self, params: Parameters) -> dict[str, Tensor]:
+        """The constrained parameters, plus what every step uses: the move
+        weights per cell and the phase distributions on entering a light or stop."""
+        p = params.constrained()
         w = p["move_probs"][self.segment]  # [n_cells, k]
-        return torch.cat([w[:-1], self._end_row[None]], 0)
+        p["move_weights"] = torch.cat([w[:-1], self._end_row[None]], 0)
+        p["light_entry"] = p["p_red"][:, None] * p["light_pi"]  # [n_lights, P]
+        p["dwell_entry"] = p["p_stop"][:, None] * p["dwell_pi"]
+        return p
 
     def _obs(self, p: dict[str, Tensor], y: Tensor, centers: Tensor) -> Tensor:
         """p(y | cell centers): `[B, n]` for `y` `[B]`."""
@@ -140,61 +158,117 @@ class ForwardModel:
 
     def log_likelihood(self, params: Parameters, batch: ObservationBatch) -> Tensor:
         """`[B]` exact log p(y_1 … y_m | y_0) per trip."""
-        p = params.constrained()
+        p = self._kernel(params)
         dtype, dev = self.dtype, self.device
         y = torch.as_tensor(batch.y, dtype=dtype, device=dev)
         mask = torch.as_tensor(batch.mask, device=dev)
         sched = torch.as_tensor(batch.sched_steps, dtype=torch.long, device=dev)
-        b, n_steps = y.shape[0], y.shape[1] - 1
-        n_phases = p["light_pi"].shape[-1]
-        n_lights, n_stops = len(self.light_cells), len(self.stop_cells)
-        w = self._move_weights(p)
-        light_entry = p["p_red"][:, None] * p["light_pi"]  # [n_lights, P]
-        dwell_entry = p["p_stop"][:, None] * p["dwell_pi"]
-        lq, dq = p["light_q"][:, None], p["dwell_q"][:, None]
+        n_steps = y.shape[1] - 1
         observed_steps = set(np.flatnonzero(batch.mask.any(0)).tolist())
 
         # Step 0: the prior of `ReferenceChain.initial`, times the first observation.
+        move, light, dwell, hold = self._initial(p, sched)
+        move, light, dwell, hold, _ = self._observe(p, move, light, dwell, hold, y[:, 0], mask[:, 0])
+        total = torch.zeros(y.shape[0], dtype=dtype, device=dev)
+        for n in range(1, n_steps + 1):
+            move, light, dwell, hold = self._step(p, move, light, dwell, hold, n, sched)
+            if n in observed_steps:
+                move, light, dwell, hold, log_c = self._observe(p, move, light, dwell, hold, y[:, n], mask[:, n])
+                total = total + log_c
+        return total
+
+    @torch.no_grad()
+    def forecast(self, params: Parameters, batch: ObservationBatch, horizons: Sequence[int]) -> Forecast:
+        """Position forecasts from every observation: the distribution over
+        cells `h` steps after each observed step, given the observations up to
+        and including it, for each `h` in `horizons` (steps, ≥ 0)."""
+        p = self._kernel(params)
+        dtype, dev = self.dtype, self.device
+        y = torch.as_tensor(batch.y, dtype=dtype, device=dev)
+        mask = torch.as_tensor(batch.mask, device=dev)
+        sched = torch.as_tensor(batch.sched_steps, dtype=torch.long, device=dev)
+        horizons = sorted(set(int(h) for h in horizons))
+
+        # Filter, keeping the state of each trip at each of its observations.
+        origins: list[tuple[Tensor, int]] = []
+        saved: list[tuple[Tensor, Tensor, Tensor, Tensor]] = []
+        move, light, dwell, hold = self._initial(p, sched)
+        for n in range(y.shape[1]):
+            if n:
+                move, light, dwell, hold = self._step(p, move, light, dwell, hold, n, sched)
+            if batch.mask[:, n].any():
+                move, light, dwell, hold, _ = self._observe(p, move, light, dwell, hold, y[:, n], mask[:, n])
+                rows = torch.nonzero(mask[:, n]).reshape(-1)
+                origins.append((rows, n))
+                saved.append((move[rows], light[rows], dwell[rows], hold[rows]))
+
+        # Roll every saved state forward with no observations, all at once.
+        trip = torch.cat([rows for rows, _ in origins])
+        start = torch.cat([torch.full((len(rows),), n, dtype=torch.long, device=dev) for rows, n in origins])
+        move, light, dwell, hold = (torch.cat([s[i] for s in saved]) for i in range(4))
+        row_sched = sched[trip]
+        out = torch.zeros(len(trip), len(horizons), self.n_cells, dtype=dtype, device=dev)
+        k = 0
+        for h in range(horizons[-1] + 1):
+            if h:
+                move, light, dwell, hold = self._step(p, move, light, dwell, hold, (start + h)[:, None], row_sched)
+            if h == horizons[k]:
+                out[:, k] = self._positions(move, light, dwell, hold)
+                k += 1
+        return Forecast(trip.cpu().numpy(), start.cpu().numpy(), np.array(horizons), out.cpu().numpy())
+
+    def _initial(self, p: dict[str, Tensor], sched: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """The prior of `ReferenceChain.initial` (unnormalised)."""
+        dtype, dev = self.dtype, self.device
+        b, n_phases = sched.shape[0], p["light_pi"].shape[-1]
         early = sched > 0
         move = torch.ones(b, self.n_cells, dtype=dtype, device=dev)
         move = move.index_put((torch.arange(b, device=dev)[:, None], self.stop_cells[None].expand(b, -1)),
                               (~early).to(dtype))
         hold = early.to(dtype)
-        light = torch.zeros(b, n_lights, n_phases, dtype=dtype, device=dev)
-        dwell = torch.zeros(b, n_stops, n_phases, dtype=dtype, device=dev)
-        move, light, dwell, hold, _ = self._observe(p, move, light, dwell, hold, y[:, 0], mask[:, 0])
-        total = torch.zeros(b, dtype=dtype, device=dev)
+        light = torch.zeros(b, len(self.light_cells), n_phases, dtype=dtype, device=dev)
+        dwell = torch.zeros(b, len(self.stop_cells), n_phases, dtype=dtype, device=dev)
+        return move, light, dwell, hold
 
+    def _step(
+        self, p: dict[str, Tensor], move: Tensor, light: Tensor, dwell: Tensor, hold: Tensor,
+        n: int | Tensor, sched: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """One 1 s transition to step `n` (an int, or `[B, 1]` per trip)."""
+        dtype, dev = self.dtype, self.device
+        b, n_lights, n_stops = move.shape[0], light.shape[1], dwell.shape[1]
+        w, light_entry, dwell_entry = p["move_weights"], p["light_entry"], p["dwell_entry"]
+        lq, dq = p["light_q"][:, None], p["dwell_q"][:, None]
         zeros_phase = torch.zeros(b, 1, dtype=dtype, device=dev)
-        for n in range(1, n_steps + 1):
-            # Moving: scatter each cell's mass by advance.
-            flow = (move[:, :, None] * w[None]).reshape(b, -1)
-            new_move = torch.zeros(b, self.n_cells, dtype=dtype, device=dev).index_add(
-                1, self.move_dest, flow[:, self.move_pos])
-            arrivals = torch.zeros(b, self.n_elements, dtype=dtype, device=dev).index_add(
-                1, self.arrive_elem, flow[:, self.arrive_pos])
-            at_light = arrivals[:, self.light_elem]
-            at_stop = arrivals[:, self.stop_elem]
 
-            # Phase chains: stay with 1 - q, advance with q, leave from the last phase.
-            l_adv, d_adv = light * lq, dwell * dq
-            new_light = light - l_adv + torch.cat([zeros_phase[:, None].expand(b, n_lights, 1), l_adv[..., :-1]], -1)
-            new_dwell = dwell - d_adv + torch.cat([zeros_phase[:, None].expand(b, n_stops, 1), d_adv[..., :-1]], -1)
-            new_light = new_light + at_light[:, :, None] * light_entry[None]
-            new_dwell = new_dwell + at_stop[:, :, None] * dwell_entry[None]
+        # Moving: scatter each cell's mass by advance.
+        flow = (move[:, :, None] * w[None]).reshape(b, -1)
+        new_move = torch.zeros(b, self.n_cells, dtype=dtype, device=dev).index_add(
+            1, self.move_dest, flow[:, self.move_pos])
+        arrivals = torch.zeros(b, self.n_elements, dtype=dtype, device=dev).index_add(
+            1, self.arrive_elem, flow[:, self.arrive_pos])
+        at_light = arrivals[:, self.light_elem]
+        at_stop = arrivals[:, self.stop_elem]
 
-            # Leaving lights, and stops (held at a timepoint until its scheduled departure).
-            new_move = new_move.index_add(1, self.light_cells, l_adv[..., -1] + at_light * (1 - p["p_red"]))
-            done = d_adv[..., -1] + at_stop * (1 - p["p_stop"]) + hold
-            early = n < sched
-            hold = torch.where(early, done, torch.zeros_like(done))
-            new_move = new_move.index_add(1, self.stop_cells, torch.where(early, torch.zeros_like(done), done))
-            move, light, dwell = new_move, new_light, new_dwell
+        # Phase chains: stay with 1 - q, advance with q, leave from the last phase.
+        l_adv, d_adv = light * lq, dwell * dq
+        new_light = light - l_adv + torch.cat([zeros_phase[:, None].expand(b, n_lights, 1), l_adv[..., :-1]], -1)
+        new_dwell = dwell - d_adv + torch.cat([zeros_phase[:, None].expand(b, n_stops, 1), d_adv[..., :-1]], -1)
+        new_light = new_light + at_light[:, :, None] * light_entry[None]
+        new_dwell = new_dwell + at_stop[:, :, None] * dwell_entry[None]
 
-            if n in observed_steps:
-                move, light, dwell, hold, log_c = self._observe(p, move, light, dwell, hold, y[:, n], mask[:, n])
-                total = total + log_c
-        return total
+        # Leaving lights, and stops (held at a timepoint until its scheduled departure).
+        new_move = new_move.index_add(1, self.light_cells, l_adv[..., -1] + at_light * (1 - p["p_red"]))
+        done = d_adv[..., -1] + at_stop * (1 - p["p_stop"]) + hold
+        early = n < sched
+        hold = torch.where(early, done, torch.zeros_like(done))
+        new_move = new_move.index_add(1, self.stop_cells, torch.where(early, torch.zeros_like(done), done))
+        return new_move, new_light, new_dwell, hold
+
+    def _positions(self, move: Tensor, light: Tensor, dwell: Tensor, hold: Tensor) -> Tensor:
+        """The distribution over cells, `[B, n_cells]`, whatever the bus is doing there."""
+        pos = move.index_add(1, self.light_cells, light.sum(-1))
+        return pos.index_add(1, self.stop_cells, dwell.sum(-1) + hold)
 
     def _observe(
         self, p: dict[str, Tensor], move: Tensor, light: Tensor, dwell: Tensor, hold: Tensor, y: Tensor, mask: Tensor,

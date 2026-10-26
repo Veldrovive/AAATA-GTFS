@@ -133,7 +133,8 @@ def simulate_trips(
         start = State("hold", 0) if sched[0] > 0 else State("move", 0)
         path = chain.simulate(max_steps, sched, rng, start=start, linger=linger)
         steps = ping_steps(len(path) - 1, rng, *cadence)
-        trips.append(TripObservations(np.array(steps), chain.observe(path, steps, rng), sched))
+        true_ft = (np.array([chain.cell(s) for s in path]) + 0.5) * chain.layout.cell_ft
+        trips.append(TripObservations(np.array(steps), chain.observe(path, steps, rng), sched, true_dist_ft=true_ft))
     return trips
 
 
@@ -207,3 +208,75 @@ def recovery_errors(fitted: ModelParams, true: ModelParams, layout: Layout) -> d
         "sigma_ft": Error.of(np.array([fitted.sigma_ft]), np.array([true.sigma_ft])),
         "outlier": Error.of(np.array([fitted.outlier]), np.array([true.outlier])),
     }
+
+
+def study_setup(seed: int, length_mi: float, n_phases: int) -> tuple[Layout, ModelParams, list[int], np.random.Generator]:
+    """`scripts/simulation_study.py`'s route, true parameters and timepoints for
+    a seed, and its generator positioned to draw the training trips next."""
+    rng = np.random.default_rng(seed)
+    layout = synthetic_layout(rng, length_ft=length_mi * 5280)
+    true = random_params(layout, rng, n_phases)
+    return layout, true, [len(layout.stops) // 2], rng
+
+
+# ------------------------------------------------------------------ forecasts
+
+
+@dataclass(frozen=True)
+class HorizonScore:
+    """How good position forecasts `horizon_s` ahead are, against the true
+    (noise-free) position, over the forecasts scored at that horizon."""
+
+    horizon_s: int
+    n: int
+    crps_ft: float  # mean continuous ranked probability score
+    median_abs_ft: float  # mean |forecast median - truth|
+    median_bias_ft: float  # mean forecast median - truth
+    coverage: float  # share of truths inside the central `level` interval
+
+
+def forecast_targets(
+    trips: Sequence[TripObservations], trip: np.ndarray, origin_step: np.ndarray, horizons: np.ndarray, end_ft: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The true distance `[R, H]` at each forecast's origin + horizon, and
+    whether it's scored: the bus hasn't reached the end of the route by then
+    (at or past it, where it is is trivial), and the simulation ran that long."""
+    truth = np.full((len(trip), len(horizons)), np.nan)
+    for r, (b, n) in enumerate(zip(trip, origin_step)):
+        true_ft = trips[b].true_dist_ft
+        if true_ft is None:
+            raise ValueError("forecasts can only be scored on simulated trips (true_dist_ft)")
+        steps = n + horizons
+        ok = steps < len(true_ft)
+        truth[r, ok] = true_ft[steps[ok]]
+    return truth, np.isfinite(truth) & (truth < end_ft)
+
+
+def score_forecasts(
+    probs: np.ndarray, centres_ft: np.ndarray, truth: np.ndarray, scored: np.ndarray, horizons: np.ndarray,
+    level: float = 0.8,
+) -> list[HorizonScore]:
+    """Scores per horizon for distributions over cells `probs` `[R, H, n_cells]`
+    (cell centres `centres_ft`) against `truth` `[R, H]` where `scored`."""
+    cdf = np.cumsum(probs, -1)
+    cdf /= cdf[..., -1:]
+    width = np.diff(centres_ft, append=centres_ft[-1] + (centres_ft[-1] - centres_ft[-2]))
+
+    def quantile(q: float) -> np.ndarray:
+        return centres_ft[np.minimum((cdf < q).sum(-1), len(centres_ft) - 1)]
+
+    median, low, high = quantile(0.5), quantile((1 - level) / 2), quantile((1 + level) / 2)
+    out = []
+    for k, h in enumerate(horizons):
+        m = scored[:, k]
+        if not m.any():
+            out.append(HorizonScore(int(h), 0, *[float("nan")] * 4))
+            continue
+        t = truth[m, k]
+        step = (centres_ft[None] >= t[:, None]).astype(float)
+        crps = ((cdf[m, k] - step) ** 2 * width[None]).sum(-1)
+        err = median[m, k] - t
+        inside = (low[m, k] <= t) & (t <= high[m, k])
+        out.append(HorizonScore(int(h), int(m.sum()), float(crps.mean()), float(np.abs(err).mean()),
+                                float(err.mean()), float(inside.mean())))
+    return out

@@ -113,10 +113,12 @@ stages rather than flags every consumer must check.
     `ReferenceChain`: the readable state-by-state definition, simulator and dense exact
     likelihood), `data.py` (`TripObservations`, `make_batch`, `by_layout`), `forward.py`
     (torch `Parameters`, `ForwardModel.log_likelihood` batched over trips sharing a
-    layout), `fit.py` (`fit_adam`, `fit_lbfgs`, `mean_log_likelihood`), `simulate.py`
-    (`synthetic_layout`, `random_params`, `simulate_trips`, `recovery_errors` in physical
-    units). `forward` and `fit`
-    need torch (the `model` extra); the rest only numpy. **`forward.py` must agree with
+    layout, and `ForwardModel.forecast`: position distributions h steps after every ping),
+    `fit.py` (`fit_adam`, `fit_lbfgs`, `mean_log_likelihood`, `observed_information`),
+    `simulate.py` (`synthetic_layout`, `random_params`, `simulate_trips` (which keep the
+    noise-free `true_dist_ft`), `study_setup` (a study seed's route and truth),
+    `recovery_errors` in physical units, and `forecast_targets` / `score_forecasts`).
+    `forward` and `fit` need torch (the `model` extra); the rest only numpy. **`forward.py` must agree with
     `ReferenceChain`**: change both together; `test_model.py` checks they match.
   - `visualization/` — `data.py`: `BusPath` (route None = not in service),
     `trace_bus_paths` (split on route change or gap), `latest_positions`
@@ -131,8 +133,11 @@ stages rather than flags every consumer must check.
 - `scripts/` — `collect.py`, `plot_route_paths.py`, `collector_status.py`,
   `compare_with_old.py`, `check_geometry.py`, `check_trips.py` (reconstruction summary and
   agency cross-check), `fetch_osm_signals.py` (run rarely, by hand; writes a blob),
-  `fit_shape.py` (fits the model to one shape) and `simulation_study.py` (parameter
-  recovery on simulated trips; tasks/simulation-study.md), both needing the `model` extra; run with
+  `fit_shape.py` (fits the model to one shape), `simulation_study.py` (parameter
+  recovery on simulated trips), `fisher_information.py` (standard errors for a study run)
+  and `prediction_study.py` (forecast error against horizon), all needing the `model`
+  extra, and `run_simulation_study.sh` (the whole study, in parallel;
+  tasks/simulation-study.md); run with
   `uv run scripts/<name>.py`. All take `--data-path`. Everything except `collect.py` and
   `fetch_osm_signals.py` opens the DB read-only (and that one only writes the blob).
 - `tests/` — offline pytest suite over real captures in `tests/fixtures/` (see SPEC.md
@@ -142,8 +147,9 @@ stages rather than flags every consumer must check.
 - `tasks/` — design notes for planned work, referenced from SPEC.md.
   `bus-position-model.md` is the agreed Phase 2 model design, with the implementation
   choices made so far; keep it current as decisions change.
-  `simulation-study.md` is how to run the parameter-recovery study on a fast machine,
-  and what to do with the results.
+  `simulation-study.md` is how to run the parameter-recovery and forecast study on a
+  big remote machine (it ran a 16 GB laptop out of memory), the results so far, and what
+  to do with the full results.
 - `data/` — collected data (gitignored).
 - `Dockerfile`, `docker-compose.yml`, `docker-entrypoint.sh`, `.dockerignore` — the
   containerized collector, running as the host user.
@@ -151,9 +157,9 @@ stages rather than flags every consumer must check.
 ## Workflow
 
 Dependencies are managed with **uv** (Python ≥ 3.13). `uv sync --extra model` installs
-everything: the dev group (pytest, pyrefly) and torch for the model (without it, the torch
-tests are skipped). torch is an optional extra so the collector's Docker image
-(`uv sync --frozen`, no extras) stays small; on Linux aarch64 (the Pi) it comes from
+everything: the dev group (pytest, pyrefly) and torch and matplotlib for the model
+(without torch, its tests are skipped). The model is an optional extra so the collector's Docker image
+(`uv sync --frozen`, no extras) stays small; on Linux aarch64 (the Pi) torch comes from
 PyTorch's CPU-only index, because PyPI's aarch64 wheels pull in CUDA.
 
 After making changes, always run both and fix anything you introduced:
