@@ -143,6 +143,38 @@ Choices made while implementing (open to change):
   over 2,787 steps: forward 3.1 s, backward 3.6 s, ~1.2 GB peak (≈ 300 MB per trip-hour,
   as estimated). Checkpointing or Fisher's identity aren't needed yet.
 
+### Parameter recovery (simulation)
+
+`scripts/simulation_study.py` draws physically varied true parameters
+(`simulate.random_params`: speeds 8–40 mph, P(red) 0.2–0.7, red waits 15–60 s, P(stop)
+0.2–0.9, dwells 8–40 s), simulates trips on a synthetic route at the feed's 25–35 s
+cadence, fits by L-BFGS from uninformed values and reports errors in physical units.
+
+Seed 0, 2 mi route (424 cells, 8 stops, 5 lights, 14 segments), 40 training trips (841
+observations), 20 held out; 155 evaluations, 15 min on the Pi:
+
+| | RMSE start | RMSE fitted | bias |
+|---|---|---|---|
+| segment speed, mph | 5.3 | 5.2 | −0.5 |
+| segment speed, mph, length-weighted | 4.8 | 3.2 | −0.1 |
+| P(red) | 0.12 | 0.12 | +0.04 |
+| mean red wait, s | 35.1 | 9.3 | −7.2 |
+| P(stop) | 0.24 | 0.22 | 0.00 |
+| mean dwell, s | 17.8 | 6.0 | +2.8 |
+| noise σ, ft | 30.0 | 1.6 | −1.6 |
+
+Log-likelihood per observation: fitted −6.052 vs truth −6.101 on the training trips, but
+−6.139 vs −6.071 held out (some overfitting). Reading: speeds on long segments, wait and
+dwell lengths, and the noise are recovered; the **probabilities P(red) and P(stop) are
+barely moved from 1/2**, and speeds on short segments aren't learnt. With a ping every
+~30 s, whether a bus stopped at an element is latent, and a short or rare wait can be
+traded against a slower segment. The expected delay per pass (P × mean wait, now
+reported) is probably what's identified. Next: several seeds and more trips (does the
+error fall like 1/√n?), a full-length route, and Fisher-information standard errors to
+tell weak identification from a fitting problem. Pooling (shared or hierarchical
+parameters across elements) would be the remedy if it's identification, but that's a
+modelling decision for the user.
+
 ## Order of work
 
 1. ✅ SPEC.md §14 items 1–2: clean trip trajectories against fix time.

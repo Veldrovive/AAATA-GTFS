@@ -3,25 +3,11 @@
 import numpy as np
 import pytest
 
-from aaata_gtfs.geometry import ShapeGeometry, ShapeStop
-from aaata_gtfs.model.chain import NO_HOLD, ReferenceChain, State, default_params, ping_steps
+from aaata_gtfs.model.chain import NO_HOLD, ReferenceChain, State, default_params
 from aaata_gtfs.model.data import TripObservations, make_batch
 from aaata_gtfs.model.layout import Layout, build_layout
+from aaata_gtfs.model.simulate import Error, recovery_errors, simulate_trips, straight_geometry
 from aaata_gtfs.osm import LightPosition
-
-FT_PER_DEG_LAT = 364_000.0
-
-
-def straight_geometry(length_ft: float, stop_ft: list[float]) -> ShapeGeometry:
-    """A north-going straight shape with stops at the given distances."""
-    n = 50
-    lat0, lon0 = 42.28, -83.74
-    points = [(lat0 + length_ft * i / (n - 1) / FT_PER_DEG_LAT, lon0) for i in range(n)]
-    stops = [
-        ShapeStop(f"s{k}", f"c{k}", None, lat0 + d / FT_PER_DEG_LAT, lon0, k + 1) for k, d in enumerate(stop_ft)
-    ]
-    return ShapeGeometry("test:straight", "T", points, stops, stop_tolerance_ft=1e9)
-
 
 def tiny_layout() -> Layout:
     """20 cells of 25 ft: stops at cells 0, 6 and 19 (the last isn't an element), a light at cell 12."""
@@ -70,15 +56,10 @@ def test_hold_until_scheduled_departure() -> None:
 
 
 def simulated_trips(layout: Layout, params_seed: int, n_trips: int, seed: int) -> list[TripObservations]:
+    """Short trips observed every 3–8 steps (dense, so the tiny route is informative)."""
     chain = ReferenceChain(layout, default_params(layout, n_phases=3, seed=params_seed))
-    rng = np.random.default_rng(seed)
-    trips = []
-    for _ in range(n_trips):
-        sched = np.array([int(rng.integers(0, 20)), NO_HOLD])
-        path = chain.simulate(400, sched, rng, start=State("hold", 0) if sched[0] > 0 else State("move", 0), linger=20)
-        steps = ping_steps(len(path) - 1, rng, low=3, high=8)
-        trips.append(TripObservations(np.array(steps), chain.observe(path, steps, rng), sched))
-    return trips
+    return simulate_trips(chain, n_trips, np.random.default_rng(seed), cadence=(3, 8), first_hold_s=(0, 19),
+                          max_steps=400, linger=20)
 
 
 def test_forward_matches_reference() -> None:
@@ -145,3 +126,11 @@ def test_fit_recovers_simulated_parameters() -> None:
     for seg in (1, 3):
         assert abs(fitted.move_probs[seg] @ advance - true.move_probs[seg] @ advance) < 0.15
     assert abs(fitted.sigma_ft - true.sigma_ft) < 5
+
+
+def test_recovery_errors() -> None:
+    layout = tiny_layout()
+    true = default_params(layout, n_phases=3, seed=1)
+    errors = recovery_errors(true, true, layout)
+    assert all(e.rmse == 0 for e in errors.values() if e.n)
+    assert Error.of(np.array([1.0, 3.0]), np.array([0.0, 0.0])) == Error(float(np.sqrt(5)), 2.0, 2.0, 2)
