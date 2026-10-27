@@ -31,14 +31,17 @@ reason) rather than flagging it:
 `stop_crossings` then interpolates each stop's arrival and departure.
 """
 
-import sqlite3
 from bisect import bisect_right
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 
 import numpy as np
+from sqlalchemy import select
+from sqlmodel import Session
 
+from aaata_gtfs import db
+from aaata_gtfs import models as m
 from aaata_gtfs.geometry import DEFAULT_MAX_OFFSET_FT, ShapeGeometry
 from aaata_gtfs.service_dates import schedule_ts
 from aaata_gtfs.shapes import GeometryResolver
@@ -82,15 +85,16 @@ class Sighting:
     header_ts: int
 
 
-def load_sightings(conn: sqlite3.Connection, start_ts: float, end_ts: float) -> list[Sighting]:
+def load_sightings(session: Session, start_ts: float, end_ts: float) -> list[Sighting]:
     """Positions with `start_ts <= fix_ts <= end_ts`, ordered by vehicle then fix time."""
+    vp, f = m.columns(m.VehiclePosition), m.columns(m.FeedSnapshot)
     return [
         Sighting(*row)
-        for row in conn.execute(
-            "SELECT vp.vehicle_id, vp.fix_ts, vp.lat, vp.lon, vp.trip_id, vp.route_id, vp.service_date, "
-            "f.header_ts FROM vehicle_position vp JOIN feed_snapshot f ON f.id = vp.snapshot_id "
-            "WHERE vp.fix_ts BETWEEN ? AND ? ORDER BY vp.vehicle_id, vp.fix_ts",
-            (int(start_ts), int(end_ts)),
+        for row in db.rows(
+            session,
+            select(vp.vehicle_id, vp.fix_ts, vp.lat, vp.lon, vp.trip_id, vp.route_id, vp.service_date, f.header_ts)
+            .join(m.table(m.FeedSnapshot), f.id == vp.snapshot_id)
+            .where(vp.fix_ts.between(int(start_ts), int(end_ts))).order_by(vp.vehicle_id, vp.fix_ts)
         )
     ]
 
@@ -127,7 +131,7 @@ class TripAssignments:
 
 
 def load_assignments(
-    conn: sqlite3.Connection, static: StaticGtfs, start_ts: float, end_ts: float
+    session: Session, static: StaticGtfs, start_ts: float, end_ts: float
 ) -> TripAssignments:
     """Trip assignments from `trip_update` rows overlapping `[start_ts, end_ts]`."""
     spans: dict[tuple[str, str | None], float] = {}
@@ -142,15 +146,18 @@ def load_assignments(
             )
         return spans[key]
 
-    rows = conn.execute(
-        "SELECT t.vehicle_id, t.trip_id, t.service_date, f.header_ts, l.header_ts FROM trip_update t "
-        "JOIN feed_snapshot f ON f.id = t.snapshot_id JOIN feed_snapshot l ON l.id = t.last_seen_snapshot_id "
-        "WHERE t.vehicle_id IS NOT NULL AND l.header_ts >= ? AND f.header_ts <= ?",
-        (int(start_ts), int(end_ts)),
-    ).fetchall()
+    first, last = m.table(m.FeedSnapshot).alias("first"), m.table(m.FeedSnapshot).alias("last")
+    t = m.columns(m.TripUpdate)
+    rows = db.rows(
+        session,
+        select(t.vehicle_id, t.trip_id, t.service_date, first.c.header_ts, last.c.header_ts)
+        .join(first, first.c.id == t.snapshot_id)
+        .join(last, last.c.id == t.last_seen_snapshot_id)
+        .where(t.vehicle_id.is_not(None), last.c.header_ts >= int(start_ts), first.c.header_ts <= int(end_ts)),
+    ).all()
     return TripAssignments(
-        (vehicle_id, Assignment(trip_id, service_date, first, last, scheduled_start(trip_id, service_date)))
-        for vehicle_id, trip_id, service_date, first, last in rows
+        (vehicle_id, Assignment(trip_id, service_date, first_ts, last_ts, scheduled_start(trip_id, service_date)))
+        for vehicle_id, trip_id, service_date, first_ts, last_ts in rows
     )
 
 
@@ -477,14 +484,14 @@ def reconstruct(
 
 
 def reconstruct_from_db(
-    conn: sqlite3.Connection, resolver: GeometryResolver, start_ts: float, end_ts: float
+    session: Session, resolver: GeometryResolver, start_ts: float, end_ts: float
 ) -> Reconstruction:
     """`reconstruct` (default thresholds) over the positions and trip
     assignments stored for a time range."""
     return reconstruct(
-        load_sightings(conn, start_ts, end_ts),
+        load_sightings(session, start_ts, end_ts),
         resolver,
-        load_assignments(conn, resolver.static, start_ts, end_ts),
+        load_assignments(session, resolver.static, start_ts, end_ts),
     )
 
 
@@ -543,16 +550,17 @@ def stop_crossings(trajectory: Trajectory, zone_ft: float = STOP_ZONE_FT) -> lis
     return out
 
 
-def agency_stop_passed(conn: sqlite3.Connection, trip_id: str, service_date: str | None) -> dict[int, int]:
+def agency_stop_passed(session: Session, trip_id: str, service_date: str | None) -> dict[int, int]:
     """stop_sequence -> header time of the first trips snapshot whose update for
     the trip instance no longer listed it (so the agency considered it passed)."""
     passed: dict[int, int] = {}
     previous: int | None = None
-    for first, header_ts in conn.execute(
-        "SELECT t.first_stop_sequence, f.header_ts FROM trip_update t JOIN feed_snapshot f "
-        "ON f.id = t.snapshot_id WHERE t.trip_id = ? AND t.service_date IS ? AND t.first_stop_sequence "
-        "IS NOT NULL ORDER BY f.header_ts",
-        (trip_id, service_date),
+    t, f = m.columns(m.TripUpdate), m.columns(m.FeedSnapshot)
+    for first, header_ts in db.rows(
+        session,
+        select(t.first_stop_sequence, f.header_ts).join(m.table(m.FeedSnapshot), f.id == t.snapshot_id)
+        .where(t.trip_id == trip_id, t.service_date.is_(service_date), t.first_stop_sequence.is_not(None))
+        .order_by(f.header_ts)
     ):
         if previous is not None:
             for seq in range(previous, first):

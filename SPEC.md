@@ -226,8 +226,9 @@ attribution and the README.
 - Runtime dependencies (`uv add`; take the latest versions):
   `httpx`, `gtfs-realtime-bindings` (brings `protobuf`), `numpy`, `folium` (brings
   `branca`, `jinja2`), `xyzservices`.
-  Use only the standard library for SQLite (`sqlite3`), CSV, zip, gzip, json, hashlib,
-  zoneinfo and argparse. No ORM, no pandas, no pydantic.
+  The database goes through SQLModel (SQLAlchemy) with Alembic migrations (added after
+  Phase 1; see AGENTS.md). Use the standard library for CSV, zip, gzip, json, hashlib,
+  zoneinfo and argparse. No pandas.
 - Dev group: `uv add --dev pytest pyrefly`. Copy `pyrefly.toml` from `../AAATA-Bus-API`
   (set `python-version = "3.13"`). `uv run pyrefly check` and `uv run pytest` must both pass.
 - Type annotations everywhere. pyrefly checks unannotated defs too. Prefer `dataclass(frozen=True)`
@@ -247,7 +248,7 @@ AAATA-GTFS/
     py.typed
     config.py              # URLs, USER_AGENT/REQUEST_HEADERS, DATA_PATH, intervals, LOCAL_TZ
     http.py                # shared client factory, get_bytes(), retry/backoff helper
-    db.py                  # connect(), schema DDL, migrations (PRAGMA user_version)
+    db.py                  # engines, sessions, migrate() (Alembic; models.py, migrations/)
     filestore.py           # raw blob archive: RT hourly record files, static zips, JSON payloads
     realtime.py            # protobuf -> typed records (VehicleRecord, TripUpdateRecord, ...)
     static_gtfs.py         # download/parse/load static GTFS; StaticGtfs lookup class
@@ -308,7 +309,9 @@ Add `data/` and `.env` to `.gitignore`.
   `foreign_keys=ON`, `busy_timeout=10000`. The collector is the only writer; scripts open
   read-only (`file:...?mode=ro` URI) so they can run while it collects.
 - Schema version in `PRAGMA user_version`. `db.migrate(conn)` applies an ordered list of
-  migration scripts. Phase 1 ships migration 1 = the DDL below.
+  migration scripts. Phase 1 ships migration 1 = the DDL below. *(Since replaced by
+  Alembic: the DDL below is `migrations/legacy.py` and the baseline revision, and the
+  tables are SQLModel models in `models.py`.)*
 
 ### 4.2 File store layout
 ```
@@ -617,9 +620,9 @@ with `asyncio.TaskGroup`:
 | `static_loop` | static GTFS zip, conditional GET | at startup, then every 6 h (`--static-interval-h`) |
 | `bustime_loop` | `getroutebyid` for every route in the newest static version | at startup (after the first static load), then every 60 min (`--bustime-interval-min`); random 2–5 s courtesy wait between routes; `--no-bustime` disables it |
 
-All DB writes go through one `Store` object on the event loop thread (sqlite3 is
+All DB writes go through one `Store` object on the event loop thread (SQLite is
 synchronous; writes are small and fast). Static loading may take seconds, so run it with
-`asyncio.to_thread` on its **own** connection, and keep a single writer at a time with an
+`asyncio.to_thread` in its **own** session, and keep a single writer at a time with an
 `asyncio.Lock` around writes. Each snapshot's processing is one transaction.
 
 ### 5.2 Realtime polling: ask only when new data is due

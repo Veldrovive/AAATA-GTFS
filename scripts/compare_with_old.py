@@ -116,8 +116,8 @@ def main() -> None:
         sys.exit(f"no database at {path}")
     if not args.old_data.exists():
         sys.exit(f"no old data at {args.old_data}")
-    conn = db.connect(path, read_only=True)
-    new_range = data_time_range(conn)
+    session = db.connect(path, read_only=True)
+    new_range = data_time_range(session)
     if new_range is None:
         sys.exit("no positions in the new database")
     start, end = args.start, args.end
@@ -132,11 +132,11 @@ def main() -> None:
     print(f"Window: {datetime.fromtimestamp(start, LOCAL_TZ):%Y-%m-%d %H:%M:%S} – "
           f"{datetime.fromtimestamp(end, LOCAL_TZ):%Y-%m-%d %H:%M:%S %Z}\n")
 
-    static = StaticGtfs(conn)
-    resolver = GeometryResolver(conn, static, args.data_path)
+    static = StaticGtfs(session)
+    resolver = GeometryResolver(session, static, args.data_path)
     # New positions per vehicle, with a margin so pings at the window start can match.
     by_vehicle: dict[str, list[PositionRow]] = defaultdict(list)
-    for p in positions(conn, start - MATCH_LOOKBACK_S, end + MATCH_AHEAD_S):
+    for p in positions(session, start - MATCH_LOOKBACK_S, end + MATCH_AHEAD_S):
         by_vehicle[p.vehicle_id].append(p)
     fix_times = {v: [p.fix_ts for p in rows] for v, rows in by_vehicle.items()}
 

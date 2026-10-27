@@ -16,7 +16,7 @@ def test_trace_bus_paths_splits_on_gaps_and_route_changes(loaded_store: Store) -
         if vehicle.vehicle.id == "553":
             vehicle.trip.route_id = "22"  # bus 553 switches route
     loaded_store.store_feed("vehicles", message.SerializeToString(), HEADER_TS + 33)
-    rows = positions(loaded_store.conn, 0, HEADER_TS + 30)
+    rows = positions(loaded_store.session, 0, HEADER_TS + 30)
     paths = trace_bus_paths(rows, max_gap_s=900)
     bus_553 = [p for p in paths if p.vehicle_id == "553"]
     assert [p.route_id for p in bus_553] == ["22", "4"]
@@ -29,13 +29,13 @@ def test_trace_bus_paths_splits_on_gaps_and_route_changes(loaded_store: Store) -
 
 
 def test_map_renders(loaded_store: Store, tmp_path: Path) -> None:
-    conn = loaded_store.conn
+    session = loaded_store.session
     static = loaded_store.static
     start, end = HEADER_TS - 3600, HEADER_TS
-    rows = positions(conn, start, end)
+    rows = positions(session, start, end)
     paths = trace_bus_paths(rows)
-    latest = latest_positions(conn, end)
-    resolver = GeometryResolver(conn, static, tmp_path)
+    latest = latest_positions(session, end)
+    resolver = GeometryResolver(session, static, tmp_path)
     drawings = route_drawings(static, resolver, ["4", "22"], start, end)
     kinds = {(s.shape_id, s.kind) for d in drawings.values() for s in d.shapes}
     # shp-4-06's Sunday trips are all on detour 501393, drawn as shape_501393.
@@ -65,7 +65,7 @@ def test_map_renders(loaded_store: Store, tmp_path: Path) -> None:
 
 
 def test_map_without_shapes(loaded_store: Store) -> None:
-    rows = positions(loaded_store.conn, HEADER_TS - 3600, HEADER_TS, ["22"])
+    rows = positions(loaded_store.session, HEADER_TS - 3600, HEADER_TS, ["22"])
     html = plot_route_paths(trace_bus_paths(rows), show_points=False).get_root().render()
     assert "bus-ping" in html
     assert "Detours (uncheck" not in html and "raw, joined in time order" not in html

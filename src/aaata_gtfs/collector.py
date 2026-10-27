@@ -8,7 +8,7 @@
 | bustime_loop    | getroutebyid for every static route    | after the first static load, then hourly|
 
 All DB writes happen on the event loop thread under one `asyncio.Lock`, except
-static loading, which runs in a worker thread on its own connection (holding
+static loading, which runs in a worker thread in its own session (holding
 the lock) because it takes seconds.
 """
 
@@ -16,7 +16,6 @@ import asyncio
 import logging
 import random
 import signal
-import sqlite3
 import time
 from collections import Counter
 from collections.abc import Callable, Coroutine
@@ -26,6 +25,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from sqlalchemy import Engine
+from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel import Session
 
 from aaata_gtfs import __version__, db
 from aaata_gtfs.bustime import fetch_route_payload
@@ -98,7 +100,7 @@ def _fmt_ts(ts: float) -> str:
 
 
 class Collector:
-    """Owns the DB connection, the `Store` and the HTTP client for one run."""
+    """Owns the DB session, the `Store` and the HTTP client for one run."""
 
     def __init__(self, options: CollectorOptions, client: httpx.AsyncClient,
                  clock: Callable[[], float] = time.time) -> None:
@@ -107,10 +109,10 @@ class Collector:
         self.clock = clock
         ensure_data_dir(options.data_path)
         self.db_path = db_path(options.data_path)
-        self.conn = db.open_db(self.db_path)
-        self.run_id = start_run(self.conn, __version__, options.args, clock())
-        self.static = StaticGtfs(self.conn)
-        self.store = Store(self.conn, self.static, self.run_id, options.data_path, options.archive_raw, clock())
+        self.session = db.open_db(self.db_path)
+        self.run_id = start_run(self.session, __version__, options.args, clock())
+        self.static = StaticGtfs(self.session)
+        self.store = Store(self.session, self.static, self.run_id, options.data_path, options.archive_raw, clock())
         self.lock = asyncio.Lock()
         self.static_ready = asyncio.Event()
         if self.static.latest_version() is not None:
@@ -124,8 +126,11 @@ class Collector:
         self._stall_logged = False
 
     def close(self) -> None:
-        finish_run(self.conn, self.run_id, self.clock())
-        self.conn.close()
+        finish_run(self.session, self.run_id, self.clock())
+        engine = self.session.get_bind()
+        self.session.close()
+        if isinstance(engine, Engine):
+            engine.dispose()
 
     async def _fetch(self, name: str, url: str) -> bytes:
         self.requests[name] += 1
@@ -184,7 +189,7 @@ class Collector:
                         since = _fmt_ts(self.latest_header_ts) if self.latest_header_ts else "startup"
                         log.warning("feed stalled since H=%s; polling every %.0f s", since, STALL_RETRY_S)
                         self._stall_logged = True
-            except (httpx.HTTPError, MalformedFeed, sqlite3.Error) as e:
+            except (httpx.HTTPError, MalformedFeed, SQLAlchemyError) as e:
                 self.consecutive_errors += 1
                 self.errors["realtime"] += 1
                 log.error("realtime poll failed (%d in a row): %s: %s",
@@ -215,7 +220,7 @@ class Collector:
                 await self.alerts_once()
                 errors = 0
                 delay = self.options.alerts_interval_s
-            except (httpx.HTTPError, MalformedFeed, sqlite3.Error) as e:
+            except (httpx.HTTPError, MalformedFeed, SQLAlchemyError) as e:
                 errors += 1
                 self.errors["alerts"] += 1
                 log.error("alerts poll failed (%d in a row): %s: %s", errors, type(e).__name__, e)
@@ -230,12 +235,9 @@ class Collector:
     # ------------------------------------------------------------------ static
 
     def _load_static_in_thread(self, result: FetchResult, fetched_at: float) -> str:
-        conn = db.connect(self.db_path)
-        try:
-            return load_static(conn, result.content, fetched_at, result.etag, result.last_modified,
+        with Session(self.session.get_bind()) as session:
+            return load_static(session, result.content, fetched_at, result.etag, result.last_modified,
                                self.options.data_path)
-        finally:
-            conn.close()
 
     async def static_once(self) -> str | None:
         """Check for a new static feed and load it. Returns the version served."""
@@ -258,7 +260,7 @@ class Collector:
                 if latest is None:
                     return None
                 version = latest.id
-                touch_static(self.conn, version, now, result.etag, result.last_modified)
+                touch_static(self.session, version, now, result.etag, result.last_modified)
                 log.info("static: not modified (%s)", version)
             self.static.reload()
         self.static_ready.set()
@@ -271,7 +273,7 @@ class Collector:
                 await self.static_once()
                 errors = 0
                 delay = self.options.static_interval_h * 3600
-            except (httpx.HTTPError, sqlite3.Error, OSError, ValueError) as e:
+            except (httpx.HTTPError, SQLAlchemyError, OSError, ValueError) as e:
                 errors += 1
                 self.errors["static"] += 1
                 log.error("static fetch failed (%d in a row): %s: %s", errors, type(e).__name__, e)
@@ -303,7 +305,7 @@ class Collector:
                 async with self.lock:
                     new += self.store.store_bustime(route_id, body, payload, self.clock())
                 fetched += 1
-            except (httpx.HTTPError, ValueError, sqlite3.Error) as e:
+            except (httpx.HTTPError, ValueError, SQLAlchemyError) as e:
                 self.errors["bustime"] += 1
                 log.error("getroutebyid %s failed: %s: %s", route_id, type(e).__name__, e)
         log.info("bustime: fetched %d/%d routes, %d new versions", fetched, len(route_ids), new)

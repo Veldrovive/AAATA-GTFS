@@ -1,8 +1,8 @@
 """Dedup-aware writers: nothing is stored twice when nothing changed.
 
 A `Store` keeps in-memory copies of the last stored state (latest snapshot per
-feed, latest position per vehicle, latest trip update and stop prediction per
-trip instance, latest version per detour, shape, alert and BusTime route), and
+feed, latest position per vehicle, latest trip update per trip
+instance, latest version per detour, shape, alert and BusTime route), and
 rebuilds them from the DB on construction so a restart inserts nothing new for
 data it already has. Each snapshot is processed in one transaction. The rules
 per table are in SPEC.md §4.3.
@@ -11,16 +11,34 @@ per table are in SPEC.md §4.3.
 import hashlib
 import json
 import logging
-import sqlite3
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from aaata_gtfs import filestore
+from sqlalchemy import and_, func, select, update
+from sqlalchemy.dialects.sqlite import insert
+from sqlmodel import Session, col
+
+from aaata_gtfs import db, filestore
 from aaata_gtfs.bustime import payload_hash, route_version_id
 from aaata_gtfs.config import DATA_PATH
+from aaata_gtfs.models import (
+    AlertVersion,
+    BusTimeRouteVersion,
+    CollectorRun,
+    FeedSnapshot,
+    RtShapeVersion,
+    TripModificationsDate,
+    TripModificationsTrip,
+    TripModificationsVersion,
+    TripUpdate,
+    VehiclePosition,
+    VehicleSeen,
+    columns,
+    table,
+)
 from aaata_gtfs.realtime import (
     AlertRecord,
     DecodeError,
@@ -60,23 +78,25 @@ class MalformedFeed(Exception):
         self.sha256 = sha256
 
 
-def start_run(conn: sqlite3.Connection, version: str, args: dict[str, Any], started_at: float | None = None) -> int:
+def start_run(session: Session, version: str, args: dict[str, Any], started_at: float | None = None) -> int:
     """Record a collector run and return its id."""
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO collector_run (started_at, version, args) VALUES (?, ?, ?)",
-            (started_at if started_at is not None else time.time(), version,
-             json.dumps(args, sort_keys=True, default=str)),
-        )
-    assert cur.lastrowid is not None
-    return cur.lastrowid
+    run = CollectorRun(
+        started_at=started_at if started_at is not None else time.time(), version=version,
+        args=json.dumps(args, sort_keys=True, default=str),
+    )
+    with db.write(session):
+        session.add(run)
+        session.flush()
+        run_id = run.id
+    assert run_id is not None
+    return run_id
 
 
-def finish_run(conn: sqlite3.Connection, run_id: int, stopped_at: float | None = None) -> None:
-    with conn:
-        conn.execute(
-            "UPDATE collector_run SET stopped_at = ? WHERE id = ?",
-            (stopped_at if stopped_at is not None else time.time(), run_id),
+def finish_run(session: Session, run_id: int, stopped_at: float | None = None) -> None:
+    with db.write(session):
+        session.exec(
+            update(CollectorRun).where(col(CollectorRun.id) == run_id)
+            .values(stopped_at=stopped_at if stopped_at is not None else time.time())
         )
 
 
@@ -121,6 +141,10 @@ _VEHICLE_COLUMNS = (
 )
 
 
+_Versioned = type[TripModificationsVersion] | type[RtShapeVersion] | type[AlertVersion]
+_VersionRow = TripModificationsVersion | RtShapeVersion | AlertVersion | BusTimeRouteVersion
+
+
 def _trip_fields(record: TripUpdateRecord) -> tuple[object, ...]:
     return (
         record.vehicle_id, record.update_ts, record.schedule_relationship, record.modifications_id,
@@ -146,14 +170,14 @@ class Store:
 
     def __init__(
         self,
-        conn: sqlite3.Connection,
+        session: Session,
         static: StaticGtfs,
         run_id: int,
         data_path: Path = DATA_PATH,
         archive_raw: bool = True,
         now: float | None = None,
     ) -> None:
-        self.conn = conn
+        self.session = session
         self.static = static
         self.run_id = run_id
         self.data_path = data_path
@@ -168,13 +192,14 @@ class Store:
 
     def load_caches(self, now: float) -> None:
         """Rebuild every last-state cache from the DB."""
-        conn = self.conn
+        session = self.session
+        fs = columns(FeedSnapshot)
         self.last_snapshot: dict[str, _LastSnapshot] = {}
         for feed in FEEDS:
-            row = conn.execute(
-                "SELECT id, header_ts, sha256 FROM feed_snapshot WHERE feed = ? ORDER BY header_ts DESC LIMIT 1",
-                (feed,),
-            ).fetchone()
+            row = db.rows(
+                session,
+                select(fs.id, fs.header_ts, fs.sha256).where(fs.feed == feed).order_by(fs.header_ts.desc()).limit(1)
+            ).first()
             if row:
                 self.last_snapshot[feed] = _LastSnapshot(*row)
 
@@ -182,59 +207,71 @@ class Store:
         self.open_seen: dict[str, int] = {}
         last_vehicles = self.last_snapshot.get("vehicles")
         if last_vehicles is not None:
-            self.open_seen = dict(conn.execute(
-                "SELECT vehicle_id, first_snapshot_id FROM vehicle_seen WHERE last_snapshot_id = ?",
-                (last_vehicles.id,),
-            ).fetchall())
+            seen = columns(VehicleSeen)
+            self.open_seen = {
+                vehicle_id: first
+                for vehicle_id, first in db.rows(
+                    session,
+                    select(seen.vehicle_id, seen.first_snapshot_id).where(seen.last_snapshot_id == last_vehicles.id)
+                )
+            }
 
         cutoff_ts = int(now - CACHE_LOAD_HOURS * 3600)
-        min_snapshot = conn.execute(
-            "SELECT MIN(id) FROM feed_snapshot WHERE header_ts >= ?", (cutoff_ts,)
-        ).fetchone()[0]
+        min_snapshot = db.rows(session, select(func.min(fs.id)).where(fs.header_ts >= cutoff_ts)).scalar()
         min_snapshot = min_snapshot if min_snapshot is not None else 1 << 62
 
         # Latest position per vehicle.
         self.last_fix: dict[str, tuple[int, tuple[object, ...]]] = {}
-        cols = ", ".join(_VEHICLE_COLUMNS[2:-1])
-        for row in conn.execute(
-            f"SELECT vp.vehicle_id, vp.fix_ts, {cols} FROM vehicle_position vp "
-            "JOIN (SELECT vehicle_id, MAX(fix_ts) AS fix_ts FROM vehicle_position WHERE fix_ts >= ? "
-            "GROUP BY vehicle_id) m USING (vehicle_id, fix_ts)",
-            (cutoff_ts,),
+        vp = columns(VehiclePosition)
+        latest = (
+            select(vp.vehicle_id, func.max(vp.fix_ts).label("fix_ts"))
+            .where(vp.fix_ts >= cutoff_ts).group_by(vp.vehicle_id).subquery()
+        )
+        for row in db.rows(
+            session,
+            select(*(vp[c] for c in _VEHICLE_COLUMNS[:-1]))
+            .join(latest, and_(vp.vehicle_id == latest.c.vehicle_id, vp.fix_ts == latest.c.fix_ts))
         ):
             self.last_fix[row[0]] = (row[1], tuple(row[2:]))
 
         # Latest trip update per trip instance.
         self.trips: dict[tuple[str, str], _TripState] = {}
-        for row in conn.execute(
-            f"SELECT tu.id, tu.trip_id, tu.service_date, {', '.join('tu.' + f for f in _TRIP_FIELDS)} "
-            "FROM trip_update tu JOIN (SELECT MAX(id) AS id FROM trip_update WHERE snapshot_id >= ? "
-            "GROUP BY trip_id, service_date) m ON tu.id = m.id",
-            (min_snapshot,),
+        tu = columns(TripUpdate)
+        latest_ids = (
+            select(func.max(tu.id)).where(tu.snapshot_id >= min_snapshot).group_by(tu.trip_id, tu.service_date)
+        )
+        for row in db.rows(
+            session,
+            select(tu.id, tu.trip_id, tu.service_date, *(tu[f] for f in _TRIP_FIELDS)).where(tu.id.in_(latest_ids))
         ):
             self.trips[(row[1], row[2] or "")] = _TripState(row[0], tuple(row[3:]), now)
 
         # Latest version of each versioned entity: (row id, content sha256).
         self.versions: dict[str, dict[str, tuple[int, str]]] = {}
-        for kind, table, id_col in (
-            ("trip_modifications", "trip_modifications_version", "modifications_id"),
-            ("shape", "rt_shape_version", "shape_id"),
-            ("alert", "alert_version", "alert_id"),
+        for kind, model, id_col in (
+            ("trip_modifications", TripModificationsVersion, "modifications_id"),
+            ("shape", RtShapeVersion, "shape_id"),
+            ("alert", AlertVersion, "alert_id"),
         ):
+            t = columns(model)
             self.versions[kind] = {
-                row[0]: (row[1], row[2])
-                for row in conn.execute(
-                    f"SELECT t.{id_col}, t.id, t.content_sha256 FROM {table} t "
-                    f"JOIN (SELECT MAX(id) AS id FROM {table} GROUP BY {id_col}) m ON t.id = m.id"
+                entity_id: (row_id, sha)
+                for entity_id, row_id, sha in db.rows(
+                    session,
+                    select(t[id_col], t.id, t.content_sha256)
+                    .where(t.id.in_(select(func.max(t.id)).group_by(t[id_col])))
                 )
             }
+        b = columns(BusTimeRouteVersion)
         self.bustime: dict[str, tuple[int, str]] = {
-            row[0]: (row[1], row[2])
-            for row in conn.execute(
-                "SELECT b.route_id, b.id, b.content_sha256 FROM bustime_route_version b "
-                "JOIN (SELECT MAX(id) AS id FROM bustime_route_version GROUP BY route_id) m ON b.id = m.id"
+            route_id: (row_id, sha)
+            for route_id, row_id, sha in db.rows(
+                session,
+                select(b.route_id, b.id, b.content_sha256)
+                .where(b.id.in_(select(func.max(b.id)).group_by(b.route_id)))
             )
         }
+        session.commit()  # end the read transaction
 
     def prune(self, now: float) -> int:
         """Drop cached trip instances not seen for `CACHE_PRUNE_HOURS`. Returns how many."""
@@ -271,14 +308,15 @@ class Store:
         if self._is_repeat(feed, h, sha):
             return SnapshotResult(feed, h, None)
 
-        with self.conn:
+        with db.write(self.session):
             blob = filestore.append_rt(feed, h, payload, self.data_path) if self.archive_raw else None
-            cur = self.conn.execute(
-                "INSERT INTO feed_snapshot (feed, header_ts, fetched_at, sha256, n_entities, n_bytes, blob, run_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (feed, h, fetched_at, sha, len(message.entity), len(payload), blob, self.run_id),
+            snapshot = FeedSnapshot(
+                feed=feed, header_ts=h, fetched_at=fetched_at, sha256=sha, n_entities=len(message.entity),
+                n_bytes=len(payload), blob=blob, run_id=self.run_id,
             )
-            snapshot_id = cur.lastrowid
+            self.session.add(snapshot)
+            self.session.flush()
+            snapshot_id = snapshot.id
             assert snapshot_id is not None
             result = SnapshotResult(feed, h, snapshot_id)
             if feed == "vehicles":
@@ -307,9 +345,9 @@ class Store:
                 return True
             if feed == "alerts" and sha == last.sha256:
                 return True
-        exists = self.conn.execute(
-            "SELECT 1 FROM feed_snapshot WHERE feed = ? AND header_ts = ?", (feed, h)
-        ).fetchone()
+        fs = columns(FeedSnapshot)
+        exists = db.rows(self.session, select(fs.id).where(fs.feed == feed, fs.header_ts == h)).first()
+        self.session.commit()  # end the read transaction
         return exists is not None
 
     def _store_vehicles(self, message: FeedMessage, snapshot_id: int, result: SnapshotResult) -> None:
@@ -331,14 +369,12 @@ class Store:
             # A fix older than the cached one is only inserted if it's somehow missing.
             if last is None or record.fix_ts > last[0]:
                 self.last_fix[record.vehicle_id] = (record.fix_ts, content)
-            rows.append((record.vehicle_id, record.fix_ts, *content, snapshot_id))
+            rows.append(dict(zip(_VEHICLE_COLUMNS, (record.vehicle_id, record.fix_ts, *content, snapshot_id))))
+        # A Core INSERT OR IGNORE on the session's connection (same transaction), for its rowcount.
+        insert_position = insert(table(VehiclePosition)).on_conflict_do_nothing()
+        connection = self.session.connection()
         for row in rows:
-            cur = self.conn.execute(
-                f"INSERT OR IGNORE INTO vehicle_position ({', '.join(_VEHICLE_COLUMNS)}) "
-                f"VALUES ({', '.join('?' * len(_VEHICLE_COLUMNS))})",
-                row,
-            )
-            new_fixes += cur.rowcount
+            new_fixes += connection.execute(insert_position, row).rowcount
         self.stats["conflicts"] += conflicts
 
         # Presence intervals: extend those open in the previous snapshot, open new ones.
@@ -346,15 +382,15 @@ class Store:
         for vehicle_id in records:
             first = self.open_seen.get(vehicle_id)
             if first is not None:
-                self.conn.execute(
-                    "UPDATE vehicle_seen SET last_snapshot_id = ? WHERE vehicle_id = ? AND first_snapshot_id = ?",
-                    (snapshot_id, vehicle_id, first),
+                self.session.exec(
+                    update(VehicleSeen)
+                    .where(col(VehicleSeen.vehicle_id) == vehicle_id, col(VehicleSeen.first_snapshot_id) == first)
+                    .values(last_snapshot_id=snapshot_id)
                 )
                 open_seen[vehicle_id] = first
             else:
-                self.conn.execute(
-                    "INSERT INTO vehicle_seen (vehicle_id, first_snapshot_id, last_snapshot_id) VALUES (?, ?, ?)",
-                    (vehicle_id, snapshot_id, snapshot_id),
+                self.session.add(
+                    VehicleSeen(vehicle_id=vehicle_id, first_snapshot_id=snapshot_id, last_snapshot_id=snapshot_id)
                 )
                 open_seen[vehicle_id] = snapshot_id
         self.open_seen = open_seen
@@ -375,21 +411,24 @@ class Store:
             fields = _trip_fields(record)
             state = self.trips.get(key)
             if state is not None and state.fields == fields:
-                self.conn.execute(
-                    "UPDATE trip_update SET last_seen_snapshot_id = ? WHERE id = ?", (snapshot_id, state.row_id)
+                self.session.exec(
+                    update(TripUpdate).where(col(TripUpdate.id) == state.row_id)
+                    .values(last_seen_snapshot_id=snapshot_id)
                 )
                 state.last_seen = now
                 unchanged += 1
                 continue
-            cur = self.conn.execute(
-                "INSERT INTO trip_update (trip_id, service_date, route_id, vehicle_id, update_ts, "
-                "schedule_relationship, modifications_id, delay, first_stop_sequence, n_stop_time_updates, "
-                "snapshot_id, last_seen_snapshot_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (record.trip_id, service_date, record.route_id, record.vehicle_id, record.update_ts,
-                 record.schedule_relationship, record.modifications_id, record.delay,
-                 record.first_stop_sequence, record.n_stop_time_updates, snapshot_id, snapshot_id),
+            row = TripUpdate(
+                trip_id=record.trip_id, service_date=service_date, route_id=record.route_id,
+                vehicle_id=record.vehicle_id, update_ts=record.update_ts,
+                schedule_relationship=record.schedule_relationship, modifications_id=record.modifications_id,
+                delay=record.delay, first_stop_sequence=record.first_stop_sequence,
+                n_stop_time_updates=record.n_stop_time_updates, snapshot_id=snapshot_id,
+                last_seen_snapshot_id=snapshot_id,
             )
-            row_id = cur.lastrowid
+            self.session.add(row)
+            self.session.flush()
+            row_id = row.id
             assert row_id is not None
             self.trips[key] = _TripState(row_id, fields, now)
             tu_rows += 1
@@ -398,65 +437,67 @@ class Store:
             modification_versions=mods, rows_trip_update=tu_rows,
         )
 
-    def _version(self, kind: str, entity_id: str, sha: str, snapshot_id: int, table: str) -> bool:
+    def _version(self, kind: str, entity_id: str, sha: str, snapshot_id: int, model: _Versioned) -> bool:
         """Advance the latest version's `last_snapshot_id` if its content is
         unchanged and return False; return True if a new version is needed."""
         latest = self.versions[kind].get(entity_id)
         if latest is not None and latest[1] == sha:
-            self.conn.execute(f"UPDATE {table} SET last_snapshot_id = ? WHERE id = ?", (snapshot_id, latest[0]))
+            t = table(model)
+            self.session.exec(update(t).where(t.c.id == latest[0]).values(last_snapshot_id=snapshot_id))
             return False
         return True
 
+    def _add(self, row: _VersionRow) -> int:
+        """Insert a row and return its id."""
+        self.session.add(row)
+        self.session.flush()
+        assert row.id is not None
+        return row.id
+
     def _store_shape(self, record: RtShapeRecord, snapshot_id: int) -> bool:
-        if not self._version("shape", record.shape_id, record.content_sha256, snapshot_id, "rt_shape_version"):
+        if not self._version("shape", record.shape_id, record.content_sha256, snapshot_id, RtShapeVersion):
             return False
-        cur = self.conn.execute(
-            "INSERT INTO rt_shape_version (shape_id, content_sha256, encoded_polyline, first_snapshot_id, "
-            "last_snapshot_id) VALUES (?, ?, ?, ?, ?)",
-            (record.shape_id, record.content_sha256, record.encoded_polyline, snapshot_id, snapshot_id),
-        )
-        assert cur.lastrowid is not None
-        self.versions["shape"][record.shape_id] = (cur.lastrowid, record.content_sha256)
+        row_id = self._add(RtShapeVersion(
+            shape_id=record.shape_id, content_sha256=record.content_sha256,
+            encoded_polyline=record.encoded_polyline, first_snapshot_id=snapshot_id, last_snapshot_id=snapshot_id,
+        ))
+        self.versions["shape"][record.shape_id] = (row_id, record.content_sha256)
         self.stats["rows_rt_shape_version"] += 1
         return True
 
     def _store_modifications(self, record: TripModificationsRecord, snapshot_id: int) -> bool:
         if not self._version(
             "trip_modifications", record.modifications_id, record.content_sha256, snapshot_id,
-            "trip_modifications_version",
+            TripModificationsVersion,
         ):
             return False
-        cur = self.conn.execute(
-            "INSERT INTO trip_modifications_version (modifications_id, pattern_id, content_sha256, content_json, "
-            "first_snapshot_id, last_snapshot_id) VALUES (?, ?, ?, ?, ?, ?)",
-            (record.modifications_id, record.pattern_id, record.content_sha256, record.content_json,
-             snapshot_id, snapshot_id),
-        )
-        version_id = cur.lastrowid
-        assert version_id is not None
-        self.conn.executemany(
-            "INSERT OR IGNORE INTO trip_modifications_trip (version_id, trip_id, shape_id) VALUES (?, ?, ?)",
-            [(version_id, trip_id, shape_id) for trip_id, shape_id in record.selected_trips],
-        )
-        self.conn.executemany(
-            "INSERT OR IGNORE INTO trip_modifications_date (version_id, service_date) VALUES (?, ?)",
-            [(version_id, d) for d in record.service_dates],
-        )
+        version_id = self._add(TripModificationsVersion(
+            modifications_id=record.modifications_id, pattern_id=record.pattern_id,
+            content_sha256=record.content_sha256, content_json=record.content_json,
+            first_snapshot_id=snapshot_id, last_snapshot_id=snapshot_id,
+        ))
+        trips = [
+            {"version_id": version_id, "trip_id": trip_id, "shape_id": shape_id}
+            for trip_id, shape_id in record.selected_trips
+        ]
+        if trips:
+            self.session.connection().execute(insert(table(TripModificationsTrip)).on_conflict_do_nothing(), trips)
+        dates = [{"version_id": version_id, "service_date": d} for d in record.service_dates]
+        if dates:
+            self.session.connection().execute(insert(table(TripModificationsDate)).on_conflict_do_nothing(), dates)
         self.versions["trip_modifications"][record.modifications_id] = (version_id, record.content_sha256)
         self.stats["rows_trip_modifications_version"] += 1
         return True
 
     def _store_alert(self, record: AlertRecord, snapshot_id: int) -> bool:
-        if not self._version("alert", record.alert_id, record.content_sha256, snapshot_id, "alert_version"):
+        if not self._version("alert", record.alert_id, record.content_sha256, snapshot_id, AlertVersion):
             return False
-        cur = self.conn.execute(
-            "INSERT INTO alert_version (alert_id, content_sha256, content_json, header_text, route_ids, "
-            "first_snapshot_id, last_snapshot_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (record.alert_id, record.content_sha256, record.content_json, record.header_text,
-             record.route_ids, snapshot_id, snapshot_id),
-        )
-        assert cur.lastrowid is not None
-        self.versions["alert"][record.alert_id] = (cur.lastrowid, record.content_sha256)
+        row_id = self._add(AlertVersion(
+            alert_id=record.alert_id, content_sha256=record.content_sha256, content_json=record.content_json,
+            header_text=record.header_text, route_ids=record.route_ids, first_snapshot_id=snapshot_id,
+            last_snapshot_id=snapshot_id,
+        ))
+        self.versions["alert"][record.alert_id] = (row_id, record.content_sha256)
         self.stats["rows_alert_version"] += 1
         return True
 
@@ -472,19 +513,18 @@ class Store:
         route's latest version, else bump `last_checked_at`. Returns whether it was new."""
         sha = payload_hash(payload)
         latest = self.bustime.get(route_id)
-        with self.conn:
+        with db.write(self.session):
             if latest is not None and latest[1] == sha:
-                self.conn.execute(
-                    "UPDATE bustime_route_version SET last_checked_at = ? WHERE id = ?", (fetched_at, latest[0])
+                self.session.exec(
+                    update(BusTimeRouteVersion).where(col(BusTimeRouteVersion.id) == latest[0])
+                    .values(last_checked_at=fetched_at)
                 )
                 return False
             blob = filestore.put_bustime(route_id, sha, body, self.data_path)
-            cur = self.conn.execute(
-                "INSERT INTO bustime_route_version (route_id, route_version, content_sha256, fetched_at, "
-                "last_checked_at, blob) VALUES (?, ?, ?, ?, ?, ?)",
-                (route_id, route_version_id(route_id, sha), sha, fetched_at, fetched_at, blob),
-            )
-        assert cur.lastrowid is not None
-        self.bustime[route_id] = (cur.lastrowid, sha)
+            row_id = self._add(BusTimeRouteVersion(
+                route_id=route_id, route_version=route_version_id(route_id, sha), content_sha256=sha,
+                fetched_at=fetched_at, last_checked_at=fetched_at, blob=blob,
+            ))
+        self.bustime[route_id] = (row_id, sha)
         self.stats["rows_bustime_route_version"] += 1
         return True

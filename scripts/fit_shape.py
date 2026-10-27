@@ -52,15 +52,15 @@ def main() -> None:
     blob = latest_signals_blob(args.data_path)
     if blob is None:
         sys.exit("no OSM signals; run scripts/fetch_osm_signals.py first")
-    conn = db.connect(path, read_only=True)
-    data_range = data_time_range(conn)
+    session = db.connect(path, read_only=True)
+    data_range = data_time_range(session)
     if data_range is None:
         sys.exit("no positions in the database")
     start = args.start if args.start is not None else data_range[0]
     end = args.end if args.end is not None else data_range[1]
-    static = StaticGtfs(conn)
-    resolver = GeometryResolver(conn, static, args.data_path)
-    trajectories = reconstruct_from_db(conn, resolver, start, end).trajectories
+    static = StaticGtfs(session)
+    resolver = GeometryResolver(session, static, args.data_path)
+    trajectories = reconstruct_from_db(session, resolver, start, end).trajectories
     groups = by_layout(trajectories, load_signals(blob), static)
     if args.shape_id is not None:
         groups = [g for g in groups if g[0].key.endswith(f":{args.shape_id}")]

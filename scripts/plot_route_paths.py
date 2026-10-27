@@ -62,24 +62,24 @@ def main() -> None:
     path = db_path(args.data_path)
     if not path.exists():
         sys.exit(f"no database at {path}; run scripts/collect.py first")
-    conn = db.connect(path, read_only=True)
+    session = db.connect(path, read_only=True)
     output: Path = args.output or args.data_path / "route_paths.html"
 
-    data_range = data_time_range(conn)
+    data_range = data_time_range(session)
     if data_range is None and (args.start is None or args.end is None):
         sys.exit("no vehicle positions in the database yet")
     end = args.end if args.end is not None else data_range[1] if data_range else 0.0
     start = args.start if args.start is not None else end - DEFAULT_WINDOW_S
 
-    rows = positions(conn, start, end, args.routes)
+    rows = positions(session, start, end, args.routes)
     paths = trace_bus_paths(rows, max_gap_s=args.max_gap_minutes * 60)
-    latest = {} if args.no_latest else latest_positions(conn, end, args.routes)
+    latest = {} if args.no_latest else latest_positions(session, end, args.routes)
 
-    static = StaticGtfs(conn)
+    static = StaticGtfs(session)
     resolver = None
     drawings = {}
     if not args.no_route_shapes:
-        resolver = GeometryResolver(conn, static, args.data_path)
+        resolver = GeometryResolver(session, static, args.data_path)
         route_ids = set(args.routes or ()) | {p.route_id for p in paths if p.route_id is not None}
         route_ids |= {r for r in latest if r is not None}
         drawings = route_drawings(static, resolver, sorted(route_ids), start, end)

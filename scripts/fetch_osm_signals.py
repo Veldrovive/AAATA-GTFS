@@ -10,7 +10,10 @@ import sys
 import time
 from pathlib import Path
 
+from sqlalchemy import select
+
 from aaata_gtfs import db
+from aaata_gtfs import models as m
 from aaata_gtfs.config import DATA_PATH, db_path, ensure_data_dir
 from aaata_gtfs.http import make_client
 from aaata_gtfs.osm import fetch_signals, parse_signals, put_signals, shapes_bbox, signals_query
@@ -26,13 +29,12 @@ def main() -> None:
     path = db_path(args.data_path)
     if not path.exists():
         sys.exit(f"no database at {path}")
-    conn = db.connect(path, read_only=True)
-    version = StaticGtfs(conn).latest_version()
+    session = db.connect(path, read_only=True)
+    version = StaticGtfs(session).latest_version()
     if version is None:
         sys.exit("no static feed loaded")
-    points = conn.execute(
-        "SELECT lat, lon FROM static_shape_point WHERE static_version = ?", (version,)
-    ).fetchall()
+    sp = m.columns(m.StaticShapePoint)
+    points = [(lat, lon) for lat, lon in db.rows(session, select(sp.lat, sp.lon).where(sp.static_version == version))]
     bbox = shapes_bbox(points)
     if args.dry_run:
         print(signals_query(bbox))

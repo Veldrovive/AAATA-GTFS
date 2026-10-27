@@ -1,13 +1,14 @@
 """Trip reconstruction stages and stop crossings, on synthetic positions along fixture shapes."""
 
-import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
 import pytest
+from sqlmodel import Session
 
 from aaata_gtfs.geometry import ShapeGeometry
+from aaata_gtfs.models import FeedSnapshot, TripUpdate
 from aaata_gtfs.queries import ModificationVersion
 from aaata_gtfs.service_dates import schedule_ts
 from aaata_gtfs.shapes import GeometryResolver
@@ -30,8 +31,8 @@ VEHICLE = "555"
 
 
 @pytest.fixture
-def resolver(static_conn: sqlite3.Connection, static: StaticGtfs, tmp_path: Path) -> GeometryResolver:
-    return GeometryResolver(static_conn, static, tmp_path)
+def resolver(static_session: Session, static: StaticGtfs, tmp_path: Path) -> GeometryResolver:
+    return GeometryResolver(static_session, static, tmp_path)
 
 
 def geometry_of(resolver: GeometryResolver, trip_id: str) -> ShapeGeometry:
@@ -156,15 +157,16 @@ def test_stop_crossings(resolver: GeometryResolver) -> None:
     assert first.arrival_ts is None and first.departure_ts is None  # not observed
 
 
-def test_agency_stop_passed(static_conn: sqlite3.Connection) -> None:
-    run_id = start_run(static_conn, "test", {}, 0.0)
+def test_agency_stop_passed(static_session: Session) -> None:
+    run_id = start_run(static_session, "test", {}, 0.0)
     for k, (header_ts, first_seq) in enumerate([(100, 1), (130, 1), (160, 3), (190, 4)], start=1):
-        static_conn.execute(
-            "INSERT INTO feed_snapshot VALUES (?, 'trips', ?, ?, 'x', 0, 0, NULL, ?)", (k, header_ts, header_ts, run_id)
-        )
-        static_conn.execute(
-            "INSERT INTO trip_update (trip_id, service_date, first_stop_sequence, n_stop_time_updates, snapshot_id, "
-            "last_seen_snapshot_id) VALUES (?, ?, ?, 0, ?, ?)",
-            (TRIP_A, SERVICE_DATE, first_seq, k, k),
-        )
-    assert agency_stop_passed(static_conn, TRIP_A, SERVICE_DATE) == {1: 160, 2: 160, 3: 190}
+        static_session.add(FeedSnapshot(
+            id=k, feed="trips", header_ts=header_ts, fetched_at=header_ts, sha256="x", n_entities=0, n_bytes=0,
+            run_id=run_id,
+        ))
+        static_session.add(TripUpdate(
+            trip_id=TRIP_A, service_date=SERVICE_DATE, first_stop_sequence=first_seq, n_stop_time_updates=0,
+            snapshot_id=k, last_seen_snapshot_id=k,
+        ))
+    static_session.commit()
+    assert agency_stop_passed(static_session, TRIP_A, SERVICE_DATE) == {1: 160, 2: 160, 3: 190}

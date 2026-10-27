@@ -7,9 +7,10 @@ instead. `GeometryResolver` implements `geometry.GeometrySource`.
 
 import json
 import logging
-import sqlite3
 from bisect import bisect_right
 from pathlib import Path
+
+from sqlmodel import Session
 
 from aaata_gtfs import filestore
 from aaata_gtfs.bustime import parse_patterns
@@ -37,8 +38,8 @@ class GeometryResolver:
     `refresh()` to pick up newer ones.
     """
 
-    def __init__(self, conn: sqlite3.Connection, static: StaticGtfs, data_path: Path = DATA_PATH) -> None:
-        self.conn = conn
+    def __init__(self, session: Session, static: StaticGtfs, data_path: Path = DATA_PATH) -> None:
+        self.session = session
         self.static = static
         self.data_path = data_path
         self._geometries: dict[tuple[str, tuple[str, ...]], ShapeGeometry | None] = {}
@@ -46,16 +47,16 @@ class GeometryResolver:
         self.refresh()
 
     def refresh(self) -> None:
-        self.modifications = all_trip_modifications(self.conn)
+        self.modifications = all_trip_modifications(self.session)
         self._mods_by_trip: dict[str, list[ModificationVersion]] = {}
         for mod in self.modifications:
             for trip_id in mod.trips:
                 self._mods_by_trip.setdefault(trip_id, []).append(mod)
         self._rt_shapes: dict[str, list[RtShapeVersion]] = {}
-        for shape in all_rt_shapes(self.conn):
+        for shape in all_rt_shapes(self.session):
             self._rt_shapes.setdefault(shape.shape_id, []).append(shape)
         self._bustime: dict[str, list[BusTimeRouteVersion]] = {}
-        for version in bustime_route_versions(self.conn):
+        for version in bustime_route_versions(self.session):
             self._bustime.setdefault(version.route_id, []).append(version)
 
     def modification_for(

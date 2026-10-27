@@ -34,15 +34,15 @@ def main() -> None:
     path = db_path(args.data_path)
     if not path.exists():
         sys.exit(f"no database at {path}")
-    conn = db.connect(path, read_only=True)
-    data_range = data_time_range(conn)
+    session = db.connect(path, read_only=True)
+    data_range = data_time_range(session)
     if data_range is None:
         sys.exit("no positions in the database")
     end = args.end if args.end is not None else data_range[1]
     start = args.start if args.start is not None else end - 86400
-    static = StaticGtfs(conn)
-    resolver = GeometryResolver(conn, static, args.data_path)
-    result = reconstruct_from_db(conn, resolver, start, end)
+    static = StaticGtfs(session)
+    resolver = GeometryResolver(session, static, args.data_path)
+    result = reconstruct_from_db(session, resolver, start, end)
 
     trajectories = result.trajectories
     print(f"{datetime.fromtimestamp(start, LOCAL_TZ):%Y-%m-%d %H:%M} – "
@@ -58,7 +58,7 @@ def main() -> None:
 
     diffs = []
     for t in trajectories:
-        passed = agency_stop_passed(conn, t.trip_id, t.service_date)
+        passed = agency_stop_passed(session, t.trip_id, t.service_date)
         for c in stop_crossings(t)[1:]:  # the agency drops a trip's first stop early
             if c.departure_ts is not None and c.stop_sequence in passed:
                 diffs.append(passed[c.stop_sequence] - c.departure_ts)

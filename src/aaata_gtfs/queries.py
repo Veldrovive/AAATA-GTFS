@@ -1,8 +1,14 @@
 """Read helpers for analysis and visualization."""
 
-import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any, Unpack
+
+from sqlalchemy import ColumnCollection, Select, and_, func, select
+from sqlmodel import Session
+
+from aaata_gtfs import db
+from aaata_gtfs import models as m
 
 #: RT entities are "in effect" this long either side of the snapshots they were seen in.
 EFFECT_GRACE_S = 60
@@ -24,13 +30,16 @@ class PositionRow:
     snapshot_id: int
 
 
+_vp = m.columns(m.VehiclePosition)
+_fs = m.columns(m.FeedSnapshot)
 _POSITION_COLUMNS = (
-    "vehicle_id, fix_ts, lat, lon, bearing, speed_mps, trip_id, route_id, service_date, snapshot_id"
+    _vp.vehicle_id, _vp.fix_ts, _vp.lat, _vp.lon, _vp.bearing, _vp.speed_mps, _vp.trip_id, _vp.route_id,
+    _vp.service_date, _vp.snapshot_id,
 )
 
 
 def positions(
-    conn: sqlite3.Connection,
+    session: Session,
     start_ts: float,
     end_ts: float,
     route_ids: Iterable[str] | None = None,
@@ -39,80 +48,90 @@ def positions(
 
     With `route_ids`, only positions on those routes (so none out of service).
     """
-    sql = f"SELECT {_POSITION_COLUMNS} FROM vehicle_position WHERE fix_ts BETWEEN ? AND ?"
-    params: list[object] = [int(start_ts), int(end_ts)]
+    query = select(*_POSITION_COLUMNS).where(_vp.fix_ts.between(int(start_ts), int(end_ts)))
     if route_ids is not None:
-        ids = list(route_ids)
-        sql += f" AND route_id IN ({', '.join('?' * len(ids))})"
-        params += ids
-    sql += " ORDER BY vehicle_id, fix_ts"
-    return [PositionRow(*row) for row in conn.execute(sql, params)]
+        query = query.where(_vp.route_id.in_(list(route_ids)))
+    return [PositionRow(*row) for row in db.rows(session, query.order_by(_vp.vehicle_id, _vp.fix_ts))]
 
 
-def data_time_range(conn: sqlite3.Connection) -> tuple[int, int] | None:
+def data_time_range(session: Session) -> tuple[int, int] | None:
     """(earliest, latest) fix time in the DB."""
-    row = conn.execute("SELECT MIN(fix_ts), MAX(fix_ts) FROM vehicle_position").fetchone()
+    row = db.rows(session, select(func.min(_vp.fix_ts), func.max(_vp.fix_ts))).first()
     return (int(row[0]), int(row[1])) if row and row[0] is not None else None
 
 
-def latest_vehicles_snapshot(conn: sqlite3.Connection, at_or_before: float) -> tuple[int, int] | None:
+def latest_vehicles_snapshot(session: Session, at_or_before: float) -> tuple[int, int] | None:
     """(snapshot_id, header_ts) of the latest vehicles snapshot at or before a time."""
-    row = conn.execute(
-        "SELECT id, header_ts FROM feed_snapshot WHERE feed = 'vehicles' AND header_ts <= ? "
-        "ORDER BY header_ts DESC LIMIT 1",
-        (int(at_or_before),),
-    ).fetchone()
+    row = db.rows(
+        session,
+        select(_fs.id, _fs.header_ts).where(_fs.feed == "vehicles", _fs.header_ts <= int(at_or_before))
+        .order_by(_fs.header_ts.desc()).limit(1),
+    ).first()
     return (int(row[0]), int(row[1])) if row else None
 
 
-def _latest_fixes(conn: sqlite3.Connection, snapshot_id: int, header_ts: int) -> list[PositionRow]:
+def _latest_fixes(session: Session, snapshot_id: int, header_ts: int) -> list[PositionRow]:
     """Each vehicle present in a vehicles snapshot, at its latest fix as of then."""
+    seen = m.columns(m.VehicleSeen)
+    positions_p = m.table(m.VehiclePosition).alias("p")
+    p = positions_p.c
+    latest = (
+        select(seen.vehicle_id, func.max(p.fix_ts).label("fix_ts"))
+        .join(positions_p, and_(p.vehicle_id == seen.vehicle_id, p.fix_ts <= header_ts))
+        .where(seen.first_snapshot_id <= snapshot_id, seen.last_snapshot_id >= snapshot_id)
+        .group_by(seen.vehicle_id).subquery()
+    )
     return [
         PositionRow(*row)
-        for row in conn.execute(
-            f"SELECT {_POSITION_COLUMNS} FROM vehicle_position vp "
-            "JOIN (SELECT s.vehicle_id, MAX(p.fix_ts) AS fix_ts FROM vehicle_seen s "
-            "      JOIN vehicle_position p ON p.vehicle_id = s.vehicle_id AND p.fix_ts <= ? "
-            "      WHERE s.first_snapshot_id <= ? AND s.last_snapshot_id >= ? GROUP BY s.vehicle_id) m "
-            "USING (vehicle_id, fix_ts) ORDER BY vehicle_id",
-            (header_ts, snapshot_id, snapshot_id),
+        for row in db.rows(
+            session,
+            select(*_POSITION_COLUMNS)
+            .join(latest, and_(_vp.vehicle_id == latest.c.vehicle_id, _vp.fix_ts == latest.c.fix_ts))
+            .order_by(_vp.vehicle_id)
         )
     ]
 
 
-def active_positions(conn: sqlite3.Connection, at: float) -> tuple[int, list[PositionRow]] | None:
+def active_positions(session: Session, at: float) -> tuple[int, list[PositionRow]] | None:
     """(header_ts, positions) for the vehicles active at the latest vehicles
     snapshot at or before `at`: present in it, with a fix within
     `ACTIVE_MAX_AGE_S` of its header time (so stale, non-reporting buses are dropped)."""
-    snapshot = latest_vehicles_snapshot(conn, at)
+    snapshot = latest_vehicles_snapshot(session, at)
     if snapshot is None:
         return None
     snapshot_id, header_ts = snapshot
-    fixes = [p for p in _latest_fixes(conn, snapshot_id, header_ts) if header_ts - p.fix_ts <= ACTIVE_MAX_AGE_S]
+    fixes = [p for p in _latest_fixes(session, snapshot_id, header_ts) if header_ts - p.fix_ts <= ACTIVE_MAX_AGE_S]
     return header_ts, fixes
 
 
-def active_vehicles(conn: sqlite3.Connection, at: float) -> set[str]:
+def active_vehicles(session: Session, at: float) -> set[str]:
     """Vehicles active at the latest vehicles snapshot at or before `at` (see `active_positions`)."""
-    active = active_positions(conn, at)
+    active = active_positions(session, at)
     return {p.vehicle_id for p in active[1]} if active else set()
 
 
-def snapshot_near(conn: sqlite3.Connection, feed: str, t: float) -> tuple[int, int] | None:
+def snapshot_near(session: Session, feed: str, t: float) -> tuple[int, int] | None:
     """(snapshot_id, header_ts) of the feed's snapshot with header time nearest `t`."""
-    before = conn.execute(
-        "SELECT id, header_ts FROM feed_snapshot WHERE feed = ? AND header_ts <= ? ORDER BY header_ts DESC LIMIT 1",
-        (feed, int(t)),
-    ).fetchone()
-    after = conn.execute(
-        "SELECT id, header_ts FROM feed_snapshot WHERE feed = ? AND header_ts > ? ORDER BY header_ts LIMIT 1",
-        (feed, int(t)),
-    ).fetchone()
+    snapshots = select(_fs.id, _fs.header_ts).where(_fs.feed == feed)
+    before = db.rows(session, snapshots.where(_fs.header_ts <= int(t)).order_by(_fs.header_ts.desc()).limit(1)).first()
+    after = db.rows(session, snapshots.where(_fs.header_ts > int(t)).order_by(_fs.header_ts).limit(1)).first()
     found = [r for r in (before, after) if r is not None]
     if not found:
         return None
     best = min(found, key=lambda r: abs(r[1] - t))
     return int(best[0]), int(best[1])
+
+
+def _versions_query(t: ColumnCollection[str, Any], *columns: str) -> Select[Unpack[tuple[Any, ...]]]:
+    """id, the given columns, and the header times of the first and last
+    snapshots, of every row of a versioned table, oldest first."""
+    first, last = m.table(m.FeedSnapshot).alias("first"), m.table(m.FeedSnapshot).alias("last")
+    return (
+        select(t.id, *(t[c] for c in columns), first.c.header_ts, last.c.header_ts)
+        .join(first, first.c.id == t.first_snapshot_id)
+        .join(last, last.c.id == t.last_snapshot_id)
+        .order_by(first.c.header_ts, t.id)
+    )
 
 
 @dataclass(frozen=True)
@@ -135,30 +154,28 @@ class ModificationVersion:
         return service_date is None or not self.service_dates or service_date in self.service_dates
 
 
-def all_trip_modifications(conn: sqlite3.Connection) -> list[ModificationVersion]:
+def all_trip_modifications(session: Session) -> list[ModificationVersion]:
     """Every stored trip modifications version, oldest first."""
     trips: dict[int, dict[str, str | None]] = {}
-    for version_id, trip_id, shape_id in conn.execute(
-        "SELECT version_id, trip_id, shape_id FROM trip_modifications_trip"
-    ):
+    mt = m.columns(m.TripModificationsTrip)
+    for version_id, trip_id, shape_id in db.rows(session, select(mt.version_id, mt.trip_id, mt.shape_id)):
         trips.setdefault(version_id, {})[trip_id] = shape_id
     dates: dict[int, set[str]] = {}
-    for version_id, service_date in conn.execute("SELECT version_id, service_date FROM trip_modifications_date"):
+    md = m.columns(m.TripModificationsDate)
+    for version_id, service_date in db.rows(session, select(md.version_id, md.service_date)):
         dates.setdefault(version_id, set()).add(service_date)
     return [
         ModificationVersion(row[0], row[1], row[2], row[3], row[4], trips.get(row[0], {}),
                             frozenset(dates.get(row[0], ())))
-        for row in conn.execute(
-            "SELECT m.id, m.modifications_id, m.pattern_id, f.header_ts, l.header_ts "
-            "FROM trip_modifications_version m JOIN feed_snapshot f ON f.id = m.first_snapshot_id "
-            "JOIN feed_snapshot l ON l.id = m.last_snapshot_id ORDER BY f.header_ts, m.id"
+        for row in db.rows(
+            session, _versions_query(m.columns(m.TripModificationsVersion), "modifications_id", "pattern_id")
         )
     ]
 
 
-def trip_modifications_at(conn: sqlite3.Connection, t: float) -> list[ModificationVersion]:
+def trip_modifications_at(session: Session, t: float) -> list[ModificationVersion]:
     """Trip modifications (detours) in effect at `t`."""
-    return [m for m in all_trip_modifications(conn) if m.in_effect(t)]
+    return [m for m in all_trip_modifications(session) if m.in_effect(t)]
 
 
 @dataclass(frozen=True)
@@ -173,21 +190,17 @@ class RtShapeVersion:
         return self.first_ts - grace_s <= t <= self.last_ts + grace_s
 
 
-def all_rt_shapes(conn: sqlite3.Connection) -> list[RtShapeVersion]:
+def all_rt_shapes(session: Session) -> list[RtShapeVersion]:
     """Every stored RT shape version, oldest first."""
     return [
         RtShapeVersion(*row)
-        for row in conn.execute(
-            "SELECT r.id, r.shape_id, r.encoded_polyline, f.header_ts, l.header_ts FROM rt_shape_version r "
-            "JOIN feed_snapshot f ON f.id = r.first_snapshot_id JOIN feed_snapshot l ON l.id = r.last_snapshot_id "
-            "ORDER BY f.header_ts, r.id"
-        )
+        for row in db.rows(session, _versions_query(m.columns(m.RtShapeVersion), "shape_id", "encoded_polyline"))
     ]
 
 
-def rt_shape_at(conn: sqlite3.Connection, shape_id: str, t: float) -> RtShapeVersion | None:
+def rt_shape_at(session: Session, shape_id: str, t: float) -> RtShapeVersion | None:
     """The version of an RT shape in effect at `t` (the newest, if several are)."""
-    found = [s for s in all_rt_shapes(conn) if s.shape_id == shape_id and s.in_effect(t)]
+    found = [s for s in all_rt_shapes(session) if s.shape_id == shape_id and s.in_effect(t)]
     return found[-1] if found else None
 
 
@@ -202,14 +215,10 @@ class BusTimeRouteVersion:
     blob: str
 
 
-def bustime_route_versions(conn: sqlite3.Connection, route_id: str | None = None) -> list[BusTimeRouteVersion]:
+def bustime_route_versions(session: Session, route_id: str | None = None) -> list[BusTimeRouteVersion]:
     """Stored BusTime route versions, oldest first."""
-    sql = (
-        "SELECT id, route_id, route_version, content_sha256, fetched_at, last_checked_at, blob "
-        "FROM bustime_route_version"
-    )
-    params: tuple[str, ...] = ()
+    b = m.columns(m.BusTimeRouteVersion)
+    query = select(b.id, b.route_id, b.route_version, b.content_sha256, b.fetched_at, b.last_checked_at, b.blob)
     if route_id is not None:
-        sql += " WHERE route_id = ?"
-        params = (route_id,)
-    return [BusTimeRouteVersion(*row) for row in conn.execute(sql + " ORDER BY fetched_at, id", params)]
+        query = query.where(b.route_id == route_id)
+    return [BusTimeRouteVersion(*row) for row in db.rows(session, query.order_by(b.fetched_at, b.id))]

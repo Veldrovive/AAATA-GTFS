@@ -11,19 +11,26 @@ import csv
 import hashlib
 import io
 import json
-import sqlite3
 import time
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import date
+from itertools import batched
 from pathlib import Path
+from typing import Any
 
 import httpx
+from sqlalchemy import func, insert, select, update
+from sqlmodel import Session, SQLModel
 
-from aaata_gtfs import filestore
+from aaata_gtfs import db, filestore
+from aaata_gtfs import models as m
 from aaata_gtfs.config import DATA_PATH, STATIC_URL
 from aaata_gtfs.http import get
+
+#: Rows per INSERT batch when loading a feed (stop_times.txt has ~100,000).
+LOAD_CHUNK_ROWS = 5000
 
 
 @dataclass(frozen=True)
@@ -118,8 +125,26 @@ def _rows(zf: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo], name: str) -
         yield from csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""))
 
 
+def _insert_all(session: Session, model: type[SQLModel], rows: Iterable[dict[str, Any]]) -> None:
+    """INSERT OR REPLACE `rows` in chunks (so a big file isn't all in memory at once)."""
+    statement = insert(model).prefix_with("OR REPLACE")
+    for chunk in batched(rows, LOAD_CHUNK_ROWS):
+        session.exec(statement, params=list(chunk))
+
+
+def _touch(session: Session, version: str, checked_at: float, etag: str | None, last_modified: str | None) -> None:
+    v = m.columns(m.StaticVersion)
+    session.exec(
+        update(m.table(m.StaticVersion)).where(v.id == version).values(
+            last_checked_at=checked_at,
+            etag=func.coalesce(etag, v.etag),
+            last_modified=func.coalesce(last_modified, v.last_modified),
+        )
+    )
+
+
 def load_static(
-    conn: sqlite3.Connection,
+    session: Session,
     zip_bytes: bytes,
     fetched_at: float,
     etag: str | None,
@@ -133,99 +158,77 @@ def load_static(
     """
     content_sha = content_sha256(zip_bytes)
     version = content_id(content_sha)
-    with conn:
-        if conn.execute("SELECT 1 FROM static_version WHERE id = ?", (version,)).fetchone():
-            conn.execute(
-                "UPDATE static_version SET last_checked_at = ?, etag = COALESCE(?, etag), "
-                "last_modified = COALESCE(?, last_modified) WHERE id = ?",
-                (fetched_at, etag, last_modified, version),
-            )
+    with db.write(session):
+        if session.get(m.StaticVersion, version) is not None:
+            _touch(session, version, fetched_at, etag, last_modified)
             return version
 
         blob = filestore.put_static(version, zip_bytes, data_path)
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             members = _txt_members(zf)
             info = next(_rows(zf, members, "feed_info.txt"), {})
-            conn.execute(
-                "INSERT INTO static_version (id, content_sha256, zip_sha256, fetched_at, last_checked_at, "
-                "etag, last_modified, feed_version, feed_start_date, feed_end_date, blob) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    version, content_sha, hashlib.sha256(zip_bytes).hexdigest(), fetched_at, fetched_at,
-                    etag, last_modified, _text(info.get("feed_version")),
-                    _text(info.get("feed_start_date")), _text(info.get("feed_end_date")), blob,
-                ),
-            )
-            conn.executemany(
-                "INSERT OR REPLACE INTO static_route VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    (version, r["route_id"], _text(r.get("route_short_name")), _text(r.get("route_long_name")),
-                     _int(r.get("route_type")), _text(r.get("route_color")), _text(r.get("route_text_color")))
-                    for r in _rows(zf, members, "routes.txt")
-                ),
-            )
-            conn.executemany(
-                "INSERT OR REPLACE INTO static_stop VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    (version, r["stop_id"], _text(r.get("stop_code")), _text(r.get("stop_name")),
-                     _float(r.get("stop_lat")), _float(r.get("stop_lon")), _int(r.get("wheelchair_boarding")))
-                    for r in _rows(zf, members, "stops.txt")
-                ),
-            )
-            conn.executemany(
-                "INSERT OR REPLACE INTO static_trip VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    (version, r["trip_id"], r["route_id"], r["service_id"], _text(r.get("trip_headsign")),
-                     _int(r.get("direction_id")), _text(r.get("block_id")), _text(r.get("shape_id")))
-                    for r in _rows(zf, members, "trips.txt")
-                ),
-            )
-            conn.executemany(
-                "INSERT OR REPLACE INTO static_stop_time VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    (version, r["trip_id"], int(r["stop_sequence"]), r["stop_id"],
-                     parse_time(r.get("arrival_time")), parse_time(r.get("departure_time")),
-                     _float(r.get("shape_dist_traveled")), _int(r.get("timepoint")),
-                     _int(r.get("pickup_type")), _int(r.get("drop_off_type")), _text(r.get("stop_headsign")))
-                    for r in _rows(zf, members, "stop_times.txt")
-                ),
-            )
-            conn.executemany(
-                "INSERT OR REPLACE INTO static_shape_point VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    (version, r["shape_id"], int(r["shape_pt_sequence"]), float(r["shape_pt_lat"]),
-                     float(r["shape_pt_lon"]), _float(r.get("shape_dist_traveled")))
-                    for r in _rows(zf, members, "shapes.txt")
-                ),
-            )
+            session.add(m.StaticVersion(
+                id=version, content_sha256=content_sha, zip_sha256=hashlib.sha256(zip_bytes).hexdigest(),
+                fetched_at=fetched_at, last_checked_at=fetched_at, etag=etag, last_modified=last_modified,
+                feed_version=_text(info.get("feed_version")), feed_start_date=_text(info.get("feed_start_date")),
+                feed_end_date=_text(info.get("feed_end_date")), blob=blob,
+            ))
+            session.flush()
+            _insert_all(session, m.StaticRoute, (
+                {"static_version": version, "route_id": r["route_id"],
+                 "short_name": _text(r.get("route_short_name")), "long_name": _text(r.get("route_long_name")),
+                 "route_type": _int(r.get("route_type")), "color": _text(r.get("route_color")),
+                 "text_color": _text(r.get("route_text_color"))}
+                for r in _rows(zf, members, "routes.txt")
+            ))
+            _insert_all(session, m.StaticStop, (
+                {"static_version": version, "stop_id": r["stop_id"], "stop_code": _text(r.get("stop_code")),
+                 "name": _text(r.get("stop_name")), "lat": _float(r.get("stop_lat")),
+                 "lon": _float(r.get("stop_lon")), "wheelchair_boarding": _int(r.get("wheelchair_boarding"))}
+                for r in _rows(zf, members, "stops.txt")
+            ))
+            _insert_all(session, m.StaticTrip, (
+                {"static_version": version, "trip_id": r["trip_id"], "route_id": r["route_id"],
+                 "service_id": r["service_id"], "headsign": _text(r.get("trip_headsign")),
+                 "direction_id": _int(r.get("direction_id")), "block_id": _text(r.get("block_id")),
+                 "shape_id": _text(r.get("shape_id"))}
+                for r in _rows(zf, members, "trips.txt")
+            ))
+            _insert_all(session, m.StaticStopTime, (
+                {"static_version": version, "trip_id": r["trip_id"], "stop_sequence": int(r["stop_sequence"]),
+                 "stop_id": r["stop_id"], "arrival_s": parse_time(r.get("arrival_time")),
+                 "departure_s": parse_time(r.get("departure_time")),
+                 "shape_dist_m": _float(r.get("shape_dist_traveled")), "timepoint": _int(r.get("timepoint")),
+                 "pickup_type": _int(r.get("pickup_type")), "drop_off_type": _int(r.get("drop_off_type")),
+                 "stop_headsign": _text(r.get("stop_headsign"))}
+                for r in _rows(zf, members, "stop_times.txt")
+            ))
+            _insert_all(session, m.StaticShapePoint, (
+                {"static_version": version, "shape_id": r["shape_id"], "seq": int(r["shape_pt_sequence"]),
+                 "lat": float(r["shape_pt_lat"]), "lon": float(r["shape_pt_lon"]),
+                 "dist_m": _float(r.get("shape_dist_traveled"))}
+                for r in _rows(zf, members, "shapes.txt")
+            ))
             days = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-            conn.executemany(
-                "INSERT OR REPLACE INTO static_calendar VALUES (?, ?, ?, ?, ?)",
-                (
-                    (version, r["service_id"], "".join((r.get(d) or "0").strip() for d in days),
-                     r["start_date"].strip(), r["end_date"].strip())
-                    for r in _rows(zf, members, "calendar.txt")
-                ),
-            )
-            conn.executemany(
-                "INSERT OR REPLACE INTO static_calendar_date VALUES (?, ?, ?, ?)",
-                (
-                    (version, r["service_id"], r["date"].strip(), int(r["exception_type"]))
-                    for r in _rows(zf, members, "calendar_dates.txt")
-                ),
-            )
+            _insert_all(session, m.StaticCalendar, (
+                {"static_version": version, "service_id": r["service_id"],
+                 "days": "".join((r.get(d) or "0").strip() for d in days),
+                 "start_date": r["start_date"].strip(), "end_date": r["end_date"].strip()}
+                for r in _rows(zf, members, "calendar.txt")
+            ))
+            _insert_all(session, m.StaticCalendarDate, (
+                {"static_version": version, "service_id": r["service_id"], "date": r["date"].strip(),
+                 "exception_type": int(r["exception_type"])}
+                for r in _rows(zf, members, "calendar_dates.txt")
+            ))
     return version
 
 
-def touch_static(conn: sqlite3.Connection, version: str, checked_at: float,
+def touch_static(session: Session, version: str, checked_at: float,
                  etag: str | None, last_modified: str | None) -> None:
     """Record that the server still serves `version` (e.g. after a 304)."""
-    with conn:
-        conn.execute(
-            "UPDATE static_version SET last_checked_at = ?, etag = COALESCE(?, etag), "
-            "last_modified = COALESCE(?, last_modified) WHERE id = ?",
-            (checked_at, etag, last_modified, version),
-        )
+    with db.write(session):
+        _touch(session, version, checked_at, etag, last_modified)
 
 
 @dataclass(frozen=True)
@@ -304,21 +307,30 @@ class _Calendar:
     end_date: str
 
 
+_trip = m.columns(m.StaticTrip)
+_TRIP_SELECT = select(
+    _trip.static_version, _trip.trip_id, _trip.route_id, _trip.service_id, _trip.headsign, _trip.direction_id,
+    _trip.block_id, _trip.shape_id,
+)
+
+
 class StaticGtfs:
     """Read-side lookups over every stored static version, with in-memory caches.
 
     Call `reload()` after a new version is loaded.
     """
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self.conn = conn
+    def __init__(self, session: Session) -> None:
+        self.session = session
         self.reload()
 
     def reload(self) -> None:
-        rows = self.conn.execute(
-            "SELECT id, fetched_at, last_checked_at, etag, last_modified, feed_version, "
-            "feed_start_date, feed_end_date FROM static_version ORDER BY fetched_at DESC"
-        ).fetchall()
+        v = m.columns(m.StaticVersion)
+        rows = db.rows(
+            self.session,
+            select(v.id, v.fetched_at, v.last_checked_at, v.etag, v.last_modified, v.feed_version,
+                   v.feed_start_date, v.feed_end_date).order_by(v.fetched_at.desc())
+        ).all()
         #: Newest (most recently fetched) first.
         self.versions = [StaticVersion(*row) for row in rows]
         self._by_id = {v.id: v for v in self.versions}
@@ -355,11 +367,7 @@ class StaticGtfs:
         if rows is None:
             rows = [
                 StaticTrip(*row)
-                for row in self.conn.execute(
-                    "SELECT static_version, trip_id, route_id, service_id, headsign, direction_id, "
-                    "block_id, shape_id FROM static_trip WHERE trip_id = ?",
-                    (trip_id,),
-                )
+                for row in db.rows(self.session, _TRIP_SELECT.where(_trip.trip_id == trip_id))
             ]
             order = {v.id: i for i, v in enumerate(self.versions)}
             rows.sort(key=lambda t: order.get(t.version, len(order)))
@@ -385,16 +393,17 @@ class StaticGtfs:
         return found
 
     def stop_times(self, version: str, trip_id: str) -> list[StaticStopTime]:
+        st = m.columns(m.StaticStopTime)
         key = (version, trip_id)
         rows = self._stop_times.get(key)
         if rows is None:
             rows = [
                 StaticStopTime(*row)
-                for row in self.conn.execute(
-                    "SELECT trip_id, stop_sequence, stop_id, arrival_s, departure_s, shape_dist_m, "
-                    "timepoint, stop_headsign FROM static_stop_time "
-                    "WHERE static_version = ? AND trip_id = ? ORDER BY stop_sequence",
-                    key,
+                for row in db.rows(
+                    self.session,
+                    select(st.trip_id, st.stop_sequence, st.stop_id, st.arrival_s, st.departure_s,
+                           st.shape_dist_m, st.timepoint, st.stop_headsign)
+                    .where(st.static_version == version, st.trip_id == trip_id).order_by(st.stop_sequence)
                 )
             ]
             self._stop_times[key] = rows
@@ -404,24 +413,27 @@ class StaticGtfs:
         """(first departure, last arrival) in schedule seconds, or None if the trip has no times."""
         key = (version, trip_id)
         if key not in self._spans:
-            row = self.conn.execute(
-                "SELECT MIN(COALESCE(departure_s, arrival_s)), MAX(COALESCE(arrival_s, departure_s)) "
-                "FROM static_stop_time WHERE static_version = ? AND trip_id = ?",
-                key,
-            ).fetchone()
+            st = m.columns(m.StaticStopTime)
+            row = db.rows(
+                self.session,
+                select(func.min(func.coalesce(st.departure_s, st.arrival_s)),
+                       func.max(func.coalesce(st.arrival_s, st.departure_s)))
+                .where(st.static_version == version, st.trip_id == trip_id)
+            ).first()
             self._spans[key] = (int(row[0]), int(row[1])) if row and row[0] is not None else None
         return self._spans[key]
 
     def shape_points(self, version: str, shape_id: str) -> list[ShapePoint]:
+        sp = m.columns(m.StaticShapePoint)
         key = (version, shape_id)
         points = self._shapes.get(key)
         if points is None:
             points = [
                 ShapePoint(*row)
-                for row in self.conn.execute(
-                    "SELECT lat, lon, dist_m FROM static_shape_point "
-                    "WHERE static_version = ? AND shape_id = ? ORDER BY seq",
-                    key,
+                for row in db.rows(
+                    self.session,
+                    select(sp.lat, sp.lon, sp.dist_m)
+                    .where(sp.static_version == version, sp.shape_id == shape_id).order_by(sp.seq)
                 )
             ]
             self._shapes[key] = points
@@ -430,11 +442,12 @@ class StaticGtfs:
     def stops(self, version: str) -> dict[str, StaticStop]:
         stops = self._stops.get(version)
         if stops is None:
+            c = m.columns(m.StaticStop)
             stops = {
                 row[0]: StaticStop(*row)
-                for row in self.conn.execute(
-                    "SELECT stop_id, stop_code, name, lat, lon FROM static_stop WHERE static_version = ?",
-                    (version,),
+                for row in db.rows(
+                    self.session,
+                    select(c.stop_id, c.stop_code, c.name, c.lat, c.lon).where(c.static_version == version)
                 )
             }
             self._stops[version] = stops
@@ -443,12 +456,13 @@ class StaticGtfs:
     def routes(self, version: str) -> dict[str, StaticRoute]:
         routes = self._routes.get(version)
         if routes is None:
+            r = m.columns(m.StaticRoute)
             routes = {
                 row[0]: StaticRoute(*row)
-                for row in self.conn.execute(
-                    "SELECT route_id, short_name, long_name, route_type, color, text_color "
-                    "FROM static_route WHERE static_version = ?",
-                    (version,),
+                for row in db.rows(
+                    self.session,
+                    select(r.route_id, r.short_name, r.long_name, r.route_type, r.color, r.text_color)
+                    .where(r.static_version == version)
                 )
             }
             self._routes[version] = routes
@@ -460,11 +474,10 @@ class StaticGtfs:
         if trips is None:
             trips = [
                 StaticTrip(*row)
-                for row in self.conn.execute(
-                    "SELECT static_version, trip_id, route_id, service_id, headsign, direction_id, "
-                    "block_id, shape_id FROM static_trip WHERE static_version = ? AND route_id = ? "
-                    "ORDER BY trip_id",
-                    key,
+                for row in db.rows(
+                    self.session,
+                    _TRIP_SELECT.where(_trip.static_version == version, _trip.route_id == route_id)
+                    .order_by(_trip.trip_id)
                 )
             ]
             self._route_trips[key] = trips
@@ -472,13 +485,14 @@ class StaticGtfs:
 
     def route_stop_uses(self, version: str, route_id: str) -> list[tuple[str, str | None, str | None]]:
         """Distinct (stop_id, shape_id, headsign) over a route's trips' stop times."""
+        t, st = _trip, m.columns(m.StaticStopTime)
         return [
             (row[0], row[1], row[2])
-            for row in self.conn.execute(
-                "SELECT DISTINCT st.stop_id, t.shape_id, t.headsign FROM static_trip t "
-                "JOIN static_stop_time st ON st.static_version = t.static_version AND st.trip_id = t.trip_id "
-                "WHERE t.static_version = ? AND t.route_id = ?",
-                (version, route_id),
+            for row in db.rows(
+                self.session,
+                select(st.stop_id, t.shape_id, t.headsign).distinct()
+                .join(m.table(m.StaticStopTime), (st.static_version == t.static_version) & (st.trip_id == t.trip_id))
+                .where(t.static_version == version, t.route_id == route_id)
             )
         ]
 
@@ -489,18 +503,19 @@ class StaticGtfs:
     def _calendar(self, version: str) -> tuple[dict[str, _Calendar], dict[tuple[str, str], int]]:
         cal = self._calendars.get(version)
         if cal is None:
+            c, d = m.columns(m.StaticCalendar), m.columns(m.StaticCalendarDate)
             calendars = {
                 row[0]: _Calendar(row[1], row[2], row[3])
-                for row in self.conn.execute(
-                    "SELECT service_id, days, start_date, end_date FROM static_calendar WHERE static_version = ?",
-                    (version,),
+                for row in db.rows(
+                    self.session,
+                    select(c.service_id, c.days, c.start_date, c.end_date).where(c.static_version == version)
                 )
             }
             exceptions = {
                 (row[0], row[1]): int(row[2])
-                for row in self.conn.execute(
-                    "SELECT service_id, date, exception_type FROM static_calendar_date WHERE static_version = ?",
-                    (version,),
+                for row in db.rows(
+                    self.session,
+                    select(d.service_id, d.date, d.exception_type).where(d.static_version == version)
                 )
             }
             cal = (calendars, exceptions)
@@ -522,6 +537,6 @@ class StaticGtfs:
         return cal.days[weekday] == "1"
 
 
-def load_static_file(conn: sqlite3.Connection, path: Path, data_path: Path = DATA_PATH) -> str:
+def load_static_file(session: Session, path: Path, data_path: Path = DATA_PATH) -> str:
     """Load a static zip from disk (e.g. a test fixture or a manual download)."""
-    return load_static(conn, path.read_bytes(), time.time(), None, None, data_path)
+    return load_static(session, path.read_bytes(), time.time(), None, None, data_path)

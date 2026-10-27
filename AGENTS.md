@@ -32,11 +32,22 @@ stages rather than flags every consumer must check.
     `transport` for tests), `get()` (sends `REQUEST_HEADERS` per request, raises on 4xx/5xx
     but not 304; `timeout_s` overrides the client's 20 s), `get_bytes()`,
     `backoff_delay(n)` (5, 10, 20 … 120 s).
-  - `db.py` — `connect(path, read_only=False)` with the pragmas (WAL, `synchronous=NORMAL`,
-    foreign keys, `busy_timeout`), `migrate()` over `MIGRATIONS` using `PRAGMA
-    user_version`, `open_db()`, and `TABLES`. Migration 1 is the schema in SPEC.md §4.3
-    plus a few indexes (`*_snapshot`, `vehicle_seen_last`) for status queries. **Append new
-    migrations; never edit a shipped one.**
+  - `models.py` — the schema as SQLModel tables (`CollectorRun`, `FeedSnapshot`,
+    `VehiclePosition`, `TripUpdate`, `StaticTrip`, …; names match SPEC.md §4.3), `TABLES`,
+    and `table(Model)` / `columns(Model)`: typed access to a model's SQLAlchemy table and
+    columns, which queries are built on (see Conventions). Some model names clash with
+    read-side dataclasses (`static_gtfs.StaticTrip`, `queries.RtShapeVersion`, …), so import
+    the module (`from aaata_gtfs import models as m`), not the names, where both are used.
+  - `db.py` — `make_engine(path, read_only=False)` with the pragmas (WAL,
+    `synchronous=NORMAL`, foreign keys, `busy_timeout`), `connect()` → a SQLModel `Session`,
+    `open_db()` (migrated), `write(session)` (one transaction: commit, or roll back on an
+    exception), `rows(session, select(...))`, `migrate(engine)`, `current_revision`,
+    `head_revision`, and `TABLES` (names).
+  - `migrations/` — Alembic: `env.py`, `versions/` (`0001_baseline.py` is the schema as
+    shipped before Alembic), and `legacy.py`, the old `PRAGMA user_version` scripts. `migrate`
+    brings a pre-Alembic database to the last legacy version, stamps it at `0001` (nothing
+    rebuilt) and upgrades to head; a new one runs `0001`, so both have identical schemas.
+    **Never edit a shipped revision or legacy script; add a revision.**
   - `filestore.py` — raw blobs under `<data>/blobs/`: `append_rt` / `iter_rt` for hourly
     RT files of appended gzip members (8-byte BE header_ts, 4-byte BE length, payload),
     `put_static`, `put_bustime` (gzipped, named by canonical hash), `read_blob`,
@@ -84,7 +95,7 @@ stages rather than flags every consumer must check.
     passes within `PASS_OFFSET_SLACK_FT` (60 ft) of the closest compete. `snap_sightings`
     projects one vehicle's time-ordered positions near the previous on-route one on the
     same geometry `key`. `Sighting` and `GeometrySource` are the protocols it needs.
-  - `shapes.py` — `GeometryResolver(conn, static, data_path)`: `for_trip(trip_id,
+  - `shapes.py` — `GeometryResolver(session, static, data_path)`: `for_trip(trip_id,
     service_date, t)` (the detour's RT shape while a modification selecting the trip is in
     effect, else the static shape; cached per key + stop list), `static_geometry`,
     `rt_geometry`, `modification_for`, `modifications_between`, `rt_shapes_between`, and
@@ -144,8 +155,9 @@ stages rather than flags every consumer must check.
   `uv run scripts/<name>.py`. All take `--data-path`. Everything except `collect.py` and
   `fetch_osm_signals.py` opens the DB read-only (and that one only writes the blob).
 - `tests/` — offline pytest suite over real captures in `tests/fixtures/` (see SPEC.md
-  §10) and synthetic positions along fixture shapes (`test_trips.py`); `conftest.py` has the shared fixtures (`static_conn`, `store`, `loaded_store`,
-  `with_header` to make a "next refresh" of a fixture). `test_live.py` is marked `live`
+  §10) and synthetic positions along fixture shapes (`test_trips.py`); `conftest.py` has the shared fixtures (`session`, `static_session`, `store`,
+  `loaded_store`, `with_header` to make a "next refresh" of a fixture, and `sql()` to check
+  stored rows with raw SQL). `test_db.py` covers migrations, including from a legacy database. `test_live.py` is marked `live`
   and skipped by default (`uv run pytest -m live`).
 - `tasks/` — design notes for planned work, referenced from SPEC.md.
   `bus-position-model.md` is the agreed Phase 2 model design, with the implementation
@@ -175,6 +187,17 @@ uv run pyrefly check   # type checking (config in pyrefly.toml; checks unannotat
 uv run pytest          # offline tests
 ```
 
+To change the schema: edit `models.py`, then generate a revision against a database at
+head and read what it generated (SQLite needs batch mode for most changes; `env.py` turns it on):
+
+```bash
+uv run alembic revision --autogenerate -m "describe the change"   # uses AAATA_GTFS_DATA_PATH
+uv run alembic check                                              # nothing left to generate
+```
+
+The collector applies new revisions at startup (`db.open_db`); `test_db.py` checks that a
+migrated database matches the models.
+
 Add or update tests when changing behavior. Tests build modified feed messages by editing
 parsed `FeedMessage`s and re-serialising (`tests/conftest.py`), and fake the network with
 `httpx.MockTransport` (see `tests/test_collector.py`); use `asyncio.run` inside a test
@@ -182,8 +205,17 @@ rather than pytest-asyncio.
 
 ## Conventions
 
-- Type annotations everywhere; frozen dataclasses for records. No ORM, pandas or
-  pydantic: stdlib `sqlite3`, `csv`, `zipfile`, `json`, `hashlib`, `zoneinfo`, `argparse`.
+- Type annotations everywhere; frozen dataclasses for records. The database goes through
+  **SQLModel** (SQLAlchemy ORM) and **Alembic**; no raw SQL outside `migrations/legacy.py`
+  and tests. No pandas. Stdlib `csv`, `zipfile`, `json`, `hashlib`, `zoneinfo`, `argparse`.
+- **Queries:** SQLModel's `select` and `Session.exec` are only typed for up to four
+  columns, and its class attributes are typed as values, not columns. So build reads with
+  SQLAlchemy's `select` over `m.columns(Model)` and run them with `db.rows(session, ...)`;
+  insert with `session.add` (+ `flush()` for the id) or a Core `insert(m.table(Model))` on
+  `session.connection()` when you need `rowcount` or `on_conflict_do_nothing`; update with
+  `session.exec(update(...))`. Wrap writes in `with db.write(session):`.
+- Read-side lookups return frozen dataclasses (`PositionRow`, `StaticTrip`, …), not model
+  instances: loading 150k positions as ORM objects is several times slower on the Pi.
 - protobuf has stubs (`gtfs_realtime_pb2.pyi`); read optional fields through the small
   typed helpers in `realtime.py` instead of sprinkling ignores. pyrefly warns that
   `google.protobuf.*` has no stubs (`types-protobuf` isn't a dependency); that's expected.
@@ -194,7 +226,8 @@ rather than pytest-asyncio.
   be rebuildable from the DB in `Store.load_caches` (a restart must insert nothing).
 - All HTTP goes through `http.get` / `get_bytes` on the shared client, so the `User-Agent`
   is always sent.
-- Scripts that write call `ensure_data_dir()`; readers use `db.connect(..., read_only=True)`.
+- Scripts that write call `ensure_data_dir()`; readers use `db.connect(..., read_only=True)`
+  (a `Session`).
 
 ## Gotchas
 
@@ -257,7 +290,13 @@ rather than pytest-asyncio.
 - Where a shape runs both ways along a street, pings after the turnaround can snap to the
   outbound pass; the `near_ft` hint in `snap_sightings` mitigates this.
 - Predictions run on into a bus's next trip: filter by trip id.
-- **Per-stop predictions aren't in the DB** (dropped in migration 2): the agency moves
+- **Primary keys and nullability:** the original schema declares single-column primary
+  keys without `NOT NULL`, which SQLite reports as nullable; the models say NOT NULL
+  (SQLAlchemy needs it to flush several new rows at once). `env.py` drops that difference
+  from autogenerate rather than rebuilding the tables.
+- SQLAlchemy wraps `sqlite3` errors: catch `sqlalchemy.exc.SQLAlchemyError` (or
+  `OperationalError`), not `sqlite3.Error`.
+- **Per-stop predictions aren't in the DB** (dropped in legacy migration 2): the agency moves
   every stop's time on every refresh, so they were ~60% of the database. Read them from
   the raw trips archive (`filestore.iter_rt`) when evaluating the agency's predictions.
   `trip_update` versions on trip-level fields only; `update_ts` still changes most refreshes.

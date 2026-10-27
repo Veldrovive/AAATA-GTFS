@@ -8,10 +8,12 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "alembic>=1.20.1",
     "folium>=0.20.0",
     "gtfs-realtime-bindings>=3.0.0",
     "httpx>=0.28.1",
     "numpy>=2.5.4",
+    "sqlmodel>=0.0.48",
     "xyzservices>=2026.9.1",
 ]
 

@@ -1,20 +1,21 @@
 import io
-import sqlite3
 import zipfile
 from pathlib import Path
+
+from sqlmodel import Session
 
 from aaata_gtfs import db
 from aaata_gtfs.service_dates import schedule_ts, service_date_for
 from aaata_gtfs.static_gtfs import StaticGtfs, content_id, content_sha256, load_static, parse_time
-from tests.conftest import HEADER_TS, STATIC_ZIP
+from tests.conftest import HEADER_TS, STATIC_ZIP, sql
 
 
-def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in db.TABLES if t.startswith("static")}
+def table_counts(session: Session) -> dict[str, int]:
+    return {t: sql(session, f"SELECT COUNT(*) FROM {t}").scalar_one() for t in db.TABLES if t.startswith("static")}
 
 
-def test_load_counts(static_conn: sqlite3.Connection, tmp_path: Path) -> None:
-    c = table_counts(static_conn)
+def test_load_counts(static_session: Session, tmp_path: Path) -> None:
+    c = table_counts(static_session)
     assert c["static_version"] == 1
     assert c["static_route"] == 2
     assert c["static_trip"] == 452
@@ -22,10 +23,11 @@ def test_load_counts(static_conn: sqlite3.Connection, tmp_path: Path) -> None:
     assert c["static_stop"] == 132
     assert c["static_calendar"] == 3
     assert c["static_calendar_date"] == 4
-    assert static_conn.execute("SELECT COUNT(DISTINCT shape_id) FROM static_shape_point").fetchone()[0] == 4
-    version = static_conn.execute(
+    assert sql(static_session, "SELECT COUNT(DISTINCT shape_id) FROM static_shape_point").scalar_one() == 4
+    version = sql(
+        static_session,
         "SELECT feed_version, feed_start_date, feed_end_date, blob FROM static_version"
-    ).fetchone()
+    ).one()
     assert version[:3] == ("S1000302", "20260823", "20270130")
     assert (tmp_path / version[3]).read_bytes() == STATIC_ZIP.read_bytes()
 
@@ -45,11 +47,11 @@ def test_values(static: StaticGtfs) -> None:
     assert parse_time("25:01:02") == 25 * 3600 + 62
 
 
-def test_load_again_is_a_noop(static_conn: sqlite3.Connection, tmp_path: Path) -> None:
-    before = table_counts(static_conn)
-    version = load_static(static_conn, STATIC_ZIP.read_bytes(), 2000.0, '"etag"', "Sun, 25 Oct 2026", tmp_path)
-    assert table_counts(static_conn) == before
-    row = static_conn.execute("SELECT id, last_checked_at, etag FROM static_version").fetchone()
+def test_load_again_is_a_noop(static_session: Session, tmp_path: Path) -> None:
+    before = table_counts(static_session)
+    version = load_static(static_session, STATIC_ZIP.read_bytes(), 2000.0, '"etag"', "Sun, 25 Oct 2026", tmp_path)
+    assert table_counts(static_session) == before
+    row = sql(static_session, "SELECT id, last_checked_at, etag FROM static_version").one()
     assert row == (version, 2000.0, '"etag"')
 
 

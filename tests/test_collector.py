@@ -16,7 +16,7 @@ from aaata_gtfs.config import (
     db_path,
 )
 from aaata_gtfs.http import backoff_delay, make_client
-from tests.conftest import FIXTURES, HEADER_TS, STATIC_ZIP, fixture_bytes
+from tests.conftest import FIXTURES, HEADER_TS, STATIC_ZIP, fixture_bytes, sql
 
 H = 1_000_000
 
@@ -98,13 +98,13 @@ def test_collector_cycles(tmp_path: Path) -> None:
 
     # Every request identifies us.
     assert fake.requests and all(r.headers["user-agent"] == USER_AGENT for r in fake.requests)
-    conn = db.connect(db_path(tmp_path), read_only=True)
-    counts = dict(conn.execute("SELECT feed, COUNT(*) FROM feed_snapshot GROUP BY feed").fetchall())
+    session = db.connect(db_path(tmp_path), read_only=True)
+    counts = {feed: n for feed, n in sql(session, "SELECT feed, COUNT(*) FROM feed_snapshot GROUP BY feed")}
     assert counts == {"vehicles": 1, "trips": 1, "alerts": 1}
-    assert conn.execute("SELECT COUNT(*) FROM vehicle_position").fetchone()[0] == 41
-    assert conn.execute("SELECT COUNT(*) FROM vehicle_position WHERE service_date = '20261025'").fetchone()[0] == 5
-    assert conn.execute("SELECT COUNT(*) FROM bustime_route_version").fetchone()[0] == 2
-    assert conn.execute("SELECT COUNT(*) FROM static_version").fetchone()[0] == 1
-    run = conn.execute("SELECT stopped_at FROM collector_run").fetchone()
+    assert sql(session, "SELECT COUNT(*) FROM vehicle_position").scalar_one() == 41
+    assert sql(session, "SELECT COUNT(*) FROM vehicle_position WHERE service_date = '20261025'").scalar_one() == 5
+    assert sql(session, "SELECT COUNT(*) FROM bustime_route_version").scalar_one() == 2
+    assert sql(session, "SELECT COUNT(*) FROM static_version").scalar_one() == 1
+    run = sql(session, "SELECT stopped_at FROM collector_run").one()
     assert run[0] is not None
     assert (tmp_path / "blobs" / "rt" / "trips" / "2026" / "10" / "25" / "22.pbs.gz").exists()

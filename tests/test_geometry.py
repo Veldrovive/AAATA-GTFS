@@ -23,7 +23,7 @@ def static_geometry(static: StaticGtfs, shape_id: str) -> ShapeGeometry:
     version = static.latest_version()
     assert version is not None
     trip = next(t for r in ("4", "22") for t in static.route_trips(version, r) if t.shape_id == shape_id)
-    resolver = GeometryResolver(static.conn, static)
+    resolver = GeometryResolver(static.session, static)
     geometry = resolver.static_geometry(trip)
     assert geometry is not None
     return geometry
@@ -84,9 +84,9 @@ def test_project_many_chunks(static: StaticGtfs) -> None:
 
 
 def test_fixture_route_22_buses_snap(loaded_store: Store, tmp_path: Path) -> None:
-    conn = loaded_store.conn
-    resolver = GeometryResolver(conn, loaded_store.static, tmp_path)
-    rows = positions(conn, HEADER_TS - 600, HEADER_TS, ["22"])
+    session = loaded_store.session
+    resolver = GeometryResolver(session, loaded_store.static, tmp_path)
+    rows = positions(session, HEADER_TS - 600, HEADER_TS, ["22"])
     assert sorted(r.vehicle_id for r in rows) == ["505", "555"]
     snapped = {ping.position.vehicle_id: ping for ping in snap_sightings(rows, resolver)}
     on_route = snapped["505"]
@@ -101,7 +101,7 @@ def test_fixture_route_22_buses_snap(loaded_store: Store, tmp_path: Path) -> Non
 
 
 def test_resolver_picks_detour_and_static_shapes(loaded_store: Store, tmp_path: Path) -> None:
-    resolver = GeometryResolver(loaded_store.conn, loaded_store.static, tmp_path)
+    resolver = GeometryResolver(loaded_store.session, loaded_store.static, tmp_path)
     detoured = resolver.for_trip("2705010", "20261025", HEADER_TS)  # in trip_modifications_501393
     assert detoured is not None and detoured.key.startswith("rt:") and detoured.shape_id == "shape_501393"
     # Its stops are the static trip's, located on the RT shape.
@@ -118,7 +118,7 @@ def test_pattern_matching_route_22(loaded_store: Store, tmp_path: Path) -> None:
     body = (FIXTURES / "getroutebyid_22.json").read_bytes()
     payload = json.loads(body)
     loaded_store.store_bustime("22", body, payload, HEADER_TS - 100)
-    resolver = GeometryResolver(loaded_store.conn, loaded_store.static, tmp_path)
+    resolver = GeometryResolver(loaded_store.session, loaded_store.static, tmp_path)
     bustime = resolver.bustime_version_at("22", HEADER_TS)
     version = loaded_store.static.latest_version()
     assert bustime is not None and version is not None

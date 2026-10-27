@@ -52,17 +52,17 @@ def main() -> None:
     path = db_path(args.data_path)
     if not path.exists():
         sys.exit(f"no database at {path}")
-    conn = db.connect(path, read_only=True)
-    data_range = data_time_range(conn)
+    session = db.connect(path, read_only=True)
+    data_range = data_time_range(session)
     if data_range is None:
         sys.exit("no positions in the database")
     end = args.end if args.end is not None else data_range[1]
     start = args.start if args.start is not None else end - 86400
 
-    static = StaticGtfs(conn)
-    resolver = GeometryResolver(conn, static, args.data_path)
+    static = StaticGtfs(session)
+    resolver = GeometryResolver(session, static, args.data_path)
     by_vehicle: dict[str, list[PositionRow]] = defaultdict(list)
-    for p in positions(conn, start, end):
+    for p in positions(session, start, end):
         if p.trip_id is not None:
             by_vehicle[p.vehicle_id].append(p)
 

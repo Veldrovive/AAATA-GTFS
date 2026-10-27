@@ -126,7 +126,12 @@ data/
 ```
 
 The database is the source of truth; the blobs let everything be re-parsed if a parser
-bug turns up. Expect roughly 30 MB/day of blobs and the same again in the DB.
+bug turns up. Expect roughly 35 MB/day of blobs and 40 MB/day in the DB (about half
+positions, half trip updates).
+
+The schema is SQLModel tables (`src/aaata_gtfs/models.py`) migrated with Alembic; the
+collector brings the database up to date when it starts, including one from before
+Alembic, which is kept as it is. To change the schema, see AGENTS.md (Workflow).
 
 Storage in brief (details in SPEC.md §4):
 

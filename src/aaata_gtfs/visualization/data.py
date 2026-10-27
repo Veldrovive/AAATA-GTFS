@@ -1,9 +1,10 @@
 """Turning stored positions into plottable paths."""
 
-import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+
+from sqlmodel import Session
 
 from aaata_gtfs.queries import PositionRow, active_positions
 
@@ -78,11 +79,11 @@ class LatestPosition:
 
 
 def latest_positions(
-    conn: sqlite3.Connection, at: float, route_ids: Iterable[str] | None = None
+    session: Session, at: float, route_ids: Iterable[str] | None = None
 ) -> dict[str | None, list[LatestPosition]]:
     """Each route's active vehicles (see `queries.active_positions`) at the
     latest vehicles snapshot at or before `at`, keyed by route (None: not in service)."""
-    active = active_positions(conn, at)
+    active = active_positions(session, at)
     if active is None:
         return {}
     header_ts, rows = active
