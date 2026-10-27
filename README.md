@@ -135,9 +135,10 @@ Storage in brief (details in SPEC.md §4):
 - `feed_snapshot`: one row per *new* feed message (new header timestamp); repeats aren't stored.
 - `vehicle_position`: one row per `(vehicle_id, fix_ts)` — the GPS fix time, so a stale fix
   repeated across refreshes is stored once. `vehicle_seen` records contiguous presence in the feed.
-- `trip_update` + `stop_time_prediction`: a trip instance `(trip_id, service_date)` gets a
-  row only when something changed, and only the stops whose prediction changed.
-  `queries.predictions_at` reconstructs what was predicted at any snapshot.
+- `trip_update`: a trip instance `(trip_id, service_date)` gets a row only when a
+  trip-level field changed. Per-stop predictions aren't stored in the database (the agency
+  re-estimates every stop on every refresh); the raw trips archive (`blobs/rt/trips/`) keeps
+  them for evaluating the agency's predictions.
 - `trip_modifications_version`, `rt_shape_version`, `alert_version`,
   `bustime_route_version`, `static_version`: content-versioned, with the first and last
   snapshot (or check) each version was seen in.

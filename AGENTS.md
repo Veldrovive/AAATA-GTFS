@@ -93,7 +93,7 @@ stages rather than flags every consumer must check.
     RT shape versions at construction; `refresh()` to reload.
   - `queries.py` — read helpers: `positions`, `data_time_range`, `latest_vehicles_snapshot`,
     `active_positions` / `active_vehicles` (in the snapshot and fix ≤ 120 s old),
-    `predictions_at`, `snapshot_near`, `all_trip_modifications` /
+    `snapshot_near`, `all_trip_modifications` /
     `trip_modifications_at`, `all_rt_shapes` / `rt_shape_at`, `bustime_route_versions`.
     RT entities are in effect from their first snapshot − 60 s to their last + 60 s.
   - `trips.py` — trip reconstruction in filtering stages (see its docstring): `Sighting`s
@@ -257,6 +257,10 @@ rather than pytest-asyncio.
 - Where a shape runs both ways along a street, pings after the turnaround can snap to the
   outbound pass; the `near_ft` hint in `snap_sightings` mitigates this.
 - Predictions run on into a bus's next trip: filter by trip id.
+- **Per-stop predictions aren't in the DB** (dropped in migration 2): the agency moves
+  every stop's time on every refresh, so they were ~60% of the database. Read them from
+  the raw trips archive (`filestore.iter_rt`) when evaluating the agency's predictions.
+  `trip_update` versions on trip-level fields only; `update_ts` still changes most refreshes.
 - Route-level data only changes between checks (hourly BusTime, 6-hourly static), so
   changes are timed to within that interval.
 - **Docker:** the compose service runs as `${UID:-1000}:${GID:-1000}` (bash's `UID` is

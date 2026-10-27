@@ -21,7 +21,7 @@ import numpy as np
 from aaata_gtfs import db
 from aaata_gtfs.config import DATA_PATH, LOCAL_TZ, REPO_ROOT, db_path
 from aaata_gtfs.geometry import EARTH_RADIUS_FT
-from aaata_gtfs.queries import PositionRow, data_time_range, positions, predictions_at
+from aaata_gtfs.queries import PositionRow, data_time_range, positions
 from aaata_gtfs.shapes import GeometryResolver
 from aaata_gtfs.static_gtfs import StaticGtfs
 
@@ -139,10 +139,6 @@ def main() -> None:
     for p in positions(conn, start - MATCH_LOOKBACK_S, end + MATCH_AHEAD_S):
         by_vehicle[p.vehicle_id].append(p)
     fix_times = {v: [p.fix_ts for p in rows] for v, rows in by_vehicle.items()}
-    trips_snapshots = conn.execute(
-        "SELECT header_ts, id FROM feed_snapshot WHERE feed = 'trips' ORDER BY header_ts"
-    ).fetchall()
-    trips_ts = [r[0] for r in trips_snapshots]
 
     old_pings = matched = absent = never = 0
     staleness: list[float] = []
@@ -153,10 +149,6 @@ def main() -> None:
     old_unmatched_positions: Counter[str] = Counter()
     trip_agree = trip_total = 0
     trip_disagreements: list[tuple[float, str, str, str]] = []  # (ft from start/end, vehicle, old, new)
-    prediction_diffs: list[float] = []
-    prediction_misses: Counter[str] = Counter()
-    stop_map_cache: dict[str, dict[str, str]] = {}
-    predictions_cache: dict[tuple[str, str | None, int], dict[str, int | None]] = {}
 
     for t, snapshot in iter_old(args.old_data, start, end):
         route_id = str(snapshot.get("route_id"))
@@ -203,39 +195,6 @@ def main() -> None:
                         d = geometry.project(found.lat, found.lon).dist_along_ft
                         edge = min(d, geometry.length_ft - d)
                     trip_disagreements.append((edge, vehicle_id, str(first.get("trip_id")), found.trip_id))
-
-            # 5. Predictions: old minute-truncated arrival vs the new per-second one.
-            if bus_preds:
-                i_snap = bisect.bisect_left(trips_ts, t)
-                candidates = [j for j in (i_snap - 1, i_snap) if 0 <= j < len(trips_ts)]
-                if not candidates:
-                    continue
-                j = min(candidates, key=lambda k: abs(trips_ts[k] - t))
-                snapshot_id = trips_snapshots[j][1]
-                for pred in bus_preds:
-                    trip_id = str(pred.get("trip_id"))
-                    service_date = str(pred.get("service_date", "")).replace("-", "") or None
-                    version = static.version_for(service_date)
-                    if version is None:
-                        prediction_misses["no static version"] += 1
-                        continue
-                    stop_map = stop_map_cache.setdefault(version, static.stop_code_to_id(version))
-                    stop_id = stop_map.get(str(pred.get("stop_id")))
-                    if stop_id is None:
-                        prediction_misses["stop code not in GTFS"] += 1
-                        continue
-                    key = (trip_id, service_date, snapshot_id)
-                    if key not in predictions_cache:
-                        predictions_cache[key] = {
-                            r.stop_id: r.arrival_time if r.arrival_time is not None else r.departure_time
-                            for r in predictions_at(conn, trip_id, service_date, snapshot_id)
-                        }
-                    new_time = predictions_cache[key].get(stop_id)
-                    if new_time is None:
-                        prediction_misses["no GTFS prediction for trip+stop"] += 1
-                        continue
-                    old_time = datetime.fromisoformat(str(pred["predicted_arrival_at"])).timestamp()
-                    prediction_diffs.append(old_time - new_time)
 
     print("1. Fix-time matching (old ping = same vehicle within 3 ft, latest fix <= requested_at + 5 s)")
     rate = matched / old_pings if old_pings else 0.0
@@ -300,11 +259,6 @@ def main() -> None:
     else:
         print("   no matched pings with predictions")
     print()
-
-    print("5. Predictions (old predicted_arrival_at - new arrival_time at the nearest trips snapshot)")
-    print(f"   {dist_summary(prediction_diffs)}")
-    if prediction_misses:
-        print("   not compared: " + ", ".join(f"{k} {n:,}" for k, n in prediction_misses.most_common()))
 
 
 if __name__ == "__main__":

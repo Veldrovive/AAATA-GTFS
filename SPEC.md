@@ -258,7 +258,7 @@ AAATA-GTFS/
     polyline.py            # Google encoded polyline decoder
     geometry.py            # ShapeGeometry (linear referencing), spur removal, snapping
     shapes.py              # GeometryResolver: (trip_id, service_date, time) -> ShapeGeometry
-    queries.py             # read helpers for analysis/viz (positions in window, predictions_at, ...)
+    queries.py             # read helpers for analysis/viz (positions in window, detours in effect, ...)
     visualization/
       __init__.py
       data.py              # BusPath, trace_bus_paths, latest_positions (from the DB)
@@ -430,6 +430,7 @@ CREATE INDEX trip_update_trip ON trip_update(trip_id, service_date, snapshot_id)
 CREATE INDEX trip_update_vehicle ON trip_update(vehicle_id, snapshot_id);
 
 -- A stop's prediction, stored only when it changed for that trip instance + stop.
+-- Dropped by migration 2: see the note after the dedup rules.
 CREATE TABLE stop_time_prediction (
   trip_update_id   INTEGER NOT NULL REFERENCES trip_update(id),
   trip_id          TEXT NOT NULL,
@@ -465,6 +466,13 @@ This makes "what did the agency predict for stop S of trip T at time t" answerab
 (`queries.predictions_at`, §6.4) while storing only about 40% of stop-time updates. It
 also records when stops drop out of the list (`first_stop_sequence` changes), which
 approximates when each stop was passed, to within a feed refresh.
+
+**Since migration 2, `stop_time_prediction` is gone and step 1–2 are skipped:** a
+`trip_update` row is versioned on its trip-level fields only. In practice the agency moved
+every listed stop's prediction (mostly by 0–30 s) on every refresh, so no stop-time update
+was ever deduped and the table and its indexes were ~60% of the database (~180 MB a day).
+Predictions are only needed to evaluate the agency's accuracy, so that evaluation reads
+them from the raw trips archive instead (`filestore.iter_rt("trips", ...)`).
 
 #### 4.3.4 Detours (trip modifications) and RT shapes
 ```sql
@@ -638,7 +646,7 @@ project's dozens.
   (compute `service_date` via `service_date_for`), update `vehicle_seen` intervals.
 - **trips:** insert `feed_snapshot` (+ archive), then in this order:
   `rt_shape_version`, `trip_modifications_version` (+ its trips and dates),
-  `trip_update` / `stop_time_prediction` with the dedup in §4.3.3.
+  `trip_update` with the dedup in §4.3.3.
 - **alerts:** content dedup, then `alert_version`.
 
 ### 5.4 Restart safety
@@ -647,8 +655,7 @@ On startup, before polling:
   SIGTERM; handle it with `loop.add_signal_handler`) and close the DB cleanly.
 - Load caches from the DB: the last `header_ts` and sha256 per feed; open `vehicle_seen`
   intervals (those whose `last_snapshot_id` is the latest vehicles snapshot); the latest
-  `trip_update` row per `(trip_id, service_date)` and the latest `stop_time_prediction` per
-  `(trip_id, service_date, stop_sequence)`, both limited to rows from the last 36 hours; and
+  `trip_update` row per `(trip_id, service_date)`, limited to rows from the last 36 hours; and
   the latest version row per modifications id, RT shape id, alert id and BusTime route.
 - Prune in-memory caches of trip instances not seen for 6 hours.
 
@@ -656,7 +663,7 @@ On startup, before polling:
 `uv run scripts/collect.py [--data-path PATH] [--no-raw-archive] [--alerts-interval-s 300]
 [--static-interval-h 6] [--bustime-interval-min 60] [--no-bustime] [--log-level INFO]`.
 Use `logging` with timestamps, written to stdout. At INFO, log one line per stored
-snapshot (`vehicles H=… new_fixes=38/41`, `trips H=… tu_rows=24 stp_rows=277 unchanged=21`)
+snapshot (`vehicles H=… new_fixes=38/41`, `trips H=… tu_rows=24 unchanged=21`)
 and one hourly summary (requests, snapshots, rows per table, conflicts, errors).
 
 ---
@@ -710,9 +717,6 @@ Cache by `(trip_id, d0)`.
 - `active_vehicles(conn, at) -> set[str]`: vehicles in the `vehicle_seen` interval covering the
   latest vehicles snapshot at or before `at` **and** whose latest fix is within 120 s of
   that snapshot's `header_ts` (this drops stale non-reporting buses).
-- `predictions_at(conn, trip_id, service_date, snapshot_id) -> list[StopTimeRow]`: the
-  latest `stop_time_prediction` per stop with `snapshot_id <=` the given one, keeping only
-  stops at or after the `first_stop_sequence` of the trip update in effect then.
 - `trip_modifications_at(conn, t) -> list[ModificationVersion]`, `rt_shape_at(conn,
   shape_id, t)`.
 
@@ -886,7 +890,7 @@ Report (plain-text tables):
    prediction's `trip_id` with the GTFS vehicle's `trip_id` at the matched fix. Print the
    agreement rate, and list disagreements by distance from the trip's start or end (expect
    them at trip boundaries).
-5. **Predictions.** For old predictions, map `stop_id` (BusTime stpid = GTFS stop_code)
+5. **Predictions** (removed with `stop_time_prediction` in migration 2). For old predictions, map `stop_id` (BusTime stpid = GTFS stop_code)
    to a GTFS stop_id, and take the new DB's `predictions_at` for that trip and stop at the
    snapshot nearest the old `requested_at`. Print the distribution of
    `old predicted_arrival_at - new arrival_time` (expect about −60..+60 s, since the old
@@ -926,10 +930,10 @@ SQLite):
 - **Dedup:**
   - Storing the same vehicles message twice adds no rows.
   - Changing one vehicle's `fix_ts` adds exactly one position.
-  - The same trips message twice adds no `trip_update`/`stop_time_prediction` rows, but
-    advances `last_seen_snapshot_id`.
-  - Changing one stop's `arrival.time` adds one `trip_update` row and one
-    `stop_time_prediction` row.
+  - The same trips message twice adds no `trip_update` rows, but advances
+    `last_seen_snapshot_id`.
+  - Changing one stop's `arrival.time` adds nothing; dropping a passed stop adds one
+    `trip_update` row.
   - Re-sending identical trip modifications, RT shapes or alerts only bumps
     `last_snapshot_id`; changed content adds a version.
   - Build the modified messages in tests by editing parsed `FeedMessage`s and re-serialising.
@@ -1028,7 +1032,8 @@ check.
 2. **Observed stop arrivals** (done: `trips.stop_crossings`): each trip's distance-vs-fix-time
    is interpolated to every stop's distance, and cross-checked against the time
    `first_stop_sequence` passed the stop (`trips.agency_stop_passed`, §4.3.3).
-3. **Agency prediction accuracy:** compare `stop_time_prediction` (as of each observation
+3. **Agency prediction accuracy:** compare the agency's predictions, parsed from the raw
+   trips archive (as of each observation
    time and lead time) with the observed arrivals. This is the baseline any model has to
    beat.
 4. **GPS lag:** port `rides.py` and `gps_lag.py`. Phone rides now measure the lag between

@@ -6,7 +6,6 @@ from aaata_gtfs.queries import (
     active_vehicles,
     latest_vehicles_snapshot,
     positions,
-    predictions_at,
     rt_shape_at,
     trip_modifications_at,
 )
@@ -26,6 +25,16 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
         raise AssertionError("read-only connection accepted a write")
     except sqlite3.OperationalError:
         pass
+
+
+def test_migration_drops_predictions(tmp_path: Path) -> None:
+    path = tmp_path / "x.sqlite3"
+    conn = db.connect(path)
+    conn.executescript(f"BEGIN;\n{db.MIGRATIONS[0]}\nPRAGMA user_version = 1;\nCOMMIT;")
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'stop_time_prediction'").fetchone()[0]
+    assert db.migrate(conn) == len(db.MIGRATIONS)
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+    assert not {n for n in names if n.startswith("stop_time_prediction")}
 
 
 def test_rt_archive_appends_members(tmp_path: Path) -> None:
@@ -48,28 +57,6 @@ def test_positions_and_active_vehicles(loaded_store: Store) -> None:
     # Vehicles whose fix is over 120 s old at the snapshot have stopped reporting.
     stale = {r.vehicle_id for r in rows if HEADER_TS - r.fix_ts > 120}
     assert stale and active == {r.vehicle_id for r in rows} - stale
-
-
-def test_predictions_at(loaded_store: Store) -> None:
-    conn = loaded_store.conn
-    first = conn.execute("SELECT id FROM feed_snapshot WHERE feed = 'trips'").fetchone()[0]
-    before = predictions_at(conn, "1532010", None, first)
-    assert len(before) == 16 and before[0].departure_time == 1792966520
-
-    # Next refresh: the first stop has been passed and one arrival moved.
-    message = with_header(fixture_message("trips.pb"), HEADER_TS + 30)
-    tu = next(e.trip_update for e in message.entity if e.trip_update.trip.trip_id == "1532010")
-    del tu.stop_time_update[0]
-    tu.stop_time_update[0].arrival.time += 45
-    result = loaded_store.store_feed("trips", message.SerializeToString(), HEADER_TS + 33)
-    assert result.snapshot_id is not None
-    after = predictions_at(conn, "1532010", None, result.snapshot_id)
-    assert [r.stop_sequence for r in after] == list(range(2, 17))
-    moved = before[1].arrival_time
-    assert moved is not None and after[0].arrival_time == moved + 45
-    assert after[1] == before[2]  # unchanged stops come from the earlier snapshot
-    # As of the first snapshot, nothing changed.
-    assert predictions_at(conn, "1532010", None, first) == before
 
 
 def test_detours_in_effect(loaded_store: Store) -> None:

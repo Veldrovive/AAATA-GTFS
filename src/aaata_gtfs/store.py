@@ -204,7 +204,7 @@ class Store:
         ):
             self.last_fix[row[0]] = (row[1], tuple(row[2:]))
 
-        # Latest trip update per trip instance, and latest prediction per stop of it.
+        # Latest trip update per trip instance.
         self.trips: dict[tuple[str, str], _TripState] = {}
         for row in conn.execute(
             f"SELECT tu.id, tu.trip_id, tu.service_date, {', '.join('tu.' + f for f in _TRIP_FIELDS)} "
@@ -213,15 +213,6 @@ class Store:
             (min_snapshot,),
         ):
             self.trips[(row[1], row[2] or "")] = _TripState(row[0], tuple(row[3:]), now)
-        self.stops: dict[tuple[str, str], dict[int, tuple[object, ...]]] = {}
-        for row in conn.execute(
-            "SELECT trip_id, service_date, stop_sequence, stop_id, arrival_time, departure_time, "
-            "arrival_delay, departure_delay, arrival_uncertainty, departure_uncertainty, "
-            "schedule_relationship FROM stop_time_prediction WHERE snapshot_id >= ? "
-            "ORDER BY snapshot_id",
-            (min_snapshot,),
-        ):
-            self.stops.setdefault((row[0], row[1] or ""), {})[row[2]] = tuple(row[3:])
 
         # Latest version of each versioned entity: (row id, content sha256).
         self.versions: dict[str, dict[str, tuple[int, str]]] = {}
@@ -251,10 +242,6 @@ class Store:
         stale = [key for key, state in self.trips.items() if state.last_seen < cutoff]
         for key in stale:
             del self.trips[key]
-            self.stops.pop(key, None)
-        orphans = [key for key in self.stops if key not in self.trips]
-        for key in orphans:
-            del self.stops[key]
         return len(stale)
 
     # --------------------------------------------------------------- snapshots
@@ -380,16 +367,14 @@ class Store:
     ) -> None:
         shapes = sum(self._store_shape(r, snapshot_id) for r in rt_shape_records(message))
         mods = sum(self._store_modifications(r, snapshot_id) for r in trip_modifications_records(message))
-        tu_rows = stp_rows = unchanged = 0
+        tu_rows = unchanged = 0
         for record in trip_update_records(message):
             ts = record.update_ts if record.update_ts is not None else h
             service_date = service_date_for(self.static, record.trip_id, ts)
             key = (record.trip_id, service_date or "")
-            last_stops = self.stops.setdefault(key, {})
-            changed = [s for s in record.stops if last_stops.get(s.stop_sequence) != s.content()]
             fields = _trip_fields(record)
             state = self.trips.get(key)
-            if state is not None and not changed and state.fields == fields:
+            if state is not None and state.fields == fields:
                 self.conn.execute(
                     "UPDATE trip_update SET last_seen_snapshot_id = ? WHERE id = ?", (snapshot_id, state.row_id)
                 )
@@ -408,22 +393,9 @@ class Store:
             assert row_id is not None
             self.trips[key] = _TripState(row_id, fields, now)
             tu_rows += 1
-            self.conn.executemany(
-                "INSERT INTO stop_time_prediction (trip_update_id, trip_id, service_date, stop_sequence, "
-                "stop_id, arrival_time, departure_time, arrival_delay, departure_delay, arrival_uncertainty, "
-                "departure_uncertainty, schedule_relationship, observed_ts, snapshot_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (row_id, record.trip_id, service_date, s.stop_sequence, *s.content(), ts, snapshot_id)
-                    for s in changed
-                ],
-            )
-            for s in changed:
-                last_stops[s.stop_sequence] = s.content()
-            stp_rows += len(changed)
         result.counts.update(
-            tu_rows=tu_rows, stp_rows=stp_rows, unchanged=unchanged, shape_versions=shapes,
-            modification_versions=mods, rows_trip_update=tu_rows, rows_stop_time_prediction=stp_rows,
+            tu_rows=tu_rows, unchanged=unchanged, shape_versions=shapes,
+            modification_versions=mods, rows_trip_update=tu_rows,
         )
 
     def _version(self, kind: str, entity_id: str, sha: str, snapshot_id: int, table: str) -> bool:

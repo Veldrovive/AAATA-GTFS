@@ -161,8 +161,7 @@ class Collector:
                 log.info("vehicles H=%d new_fixes=%d/%d%s", result.header_ts, c["new_fixes"], c["vehicles"],
                          f" conflicts={c['conflicts']}" if c["conflicts"] else "")
             else:
-                log.info("trips H=%d tu_rows=%d stp_rows=%d unchanged=%d%s", result.header_ts, c["tu_rows"],
-                         c["stp_rows"], c["unchanged"],
+                log.info("trips H=%d tu_rows=%d unchanged=%d%s", result.header_ts, c["tu_rows"], c["unchanged"],
                          "".join(f" {k}={c[k]}" for k in ("shape_versions", "modification_versions") if c[k]))
         return any_new
 

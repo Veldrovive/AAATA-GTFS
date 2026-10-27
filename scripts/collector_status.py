@@ -111,8 +111,6 @@ def main() -> None:
         ("feed_snapshot", "SELECT COUNT(*) FROM feed_snapshot WHERE header_ts >= ? AND header_ts < ?", "ts"),
         ("vehicle_position", "SELECT COUNT(*) FROM vehicle_position WHERE fix_ts >= ? AND fix_ts < ?", "ts"),
         ("trip_update", "SELECT COUNT(*) FROM trip_update WHERE snapshot_id BETWEEN ? AND ?", "snap"),
-        ("stop_time_prediction",
-         "SELECT COUNT(*) FROM stop_time_prediction WHERE snapshot_id BETWEEN ? AND ?", "snap"),
     ):
         counts = []
         for i in range(DAYS):

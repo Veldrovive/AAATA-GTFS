@@ -98,44 +98,6 @@ def active_vehicles(conn: sqlite3.Connection, at: float) -> set[str]:
     return {p.vehicle_id for p in active[1]} if active else set()
 
 
-@dataclass(frozen=True)
-class StopTimeRow:
-    stop_sequence: int
-    stop_id: str
-    arrival_time: int | None
-    departure_time: int | None
-    arrival_delay: int | None
-    departure_delay: int | None
-    schedule_relationship: str | None
-    observed_ts: int
-    snapshot_id: int
-
-
-def predictions_at(
-    conn: sqlite3.Connection, trip_id: str, service_date: str | None, snapshot_id: int
-) -> list[StopTimeRow]:
-    """What the agency predicted for each remaining stop of a trip instance as
-    of a snapshot: the latest prediction per stop at or before it, for stops at
-    or after the `first_stop_sequence` of the trip update in effect then."""
-    tu = conn.execute(
-        "SELECT first_stop_sequence FROM trip_update WHERE trip_id = ? AND service_date IS ? "
-        "AND snapshot_id <= ? ORDER BY snapshot_id DESC, id DESC LIMIT 1",
-        (trip_id, service_date, snapshot_id),
-    ).fetchone()
-    if tu is None:
-        return []
-    first = tu[0]
-    latest: dict[int, StopTimeRow] = {}
-    for row in conn.execute(
-        "SELECT stop_sequence, stop_id, arrival_time, departure_time, arrival_delay, departure_delay, "
-        "schedule_relationship, observed_ts, snapshot_id FROM stop_time_prediction "
-        "WHERE trip_id = ? AND service_date IS ? AND snapshot_id <= ? ORDER BY stop_sequence, snapshot_id",
-        (trip_id, service_date, snapshot_id),
-    ):
-        latest[row[0]] = StopTimeRow(*row)
-    return [r for seq, r in sorted(latest.items()) if first is None or seq >= first]
-
-
 def snapshot_near(conn: sqlite3.Connection, feed: str, t: float) -> tuple[int, int] | None:
     """(snapshot_id, header_ts) of the feed's snapshot with header time nearest `t`."""
     before = conn.execute(

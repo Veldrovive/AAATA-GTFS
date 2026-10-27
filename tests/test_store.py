@@ -20,7 +20,6 @@ def test_first_snapshots(loaded_store: Store) -> None:
     assert c["vehicle_position"] == 41
     assert c["vehicle_seen"] == 41
     assert c["trip_update"] == 45
-    assert c["stop_time_prediction"] == 696
     assert c["trip_modifications_version"] == 6
     assert c["trip_modifications_trip"] == 108 + 10 + 82 + 9 + 80 + 61
     assert c["rt_shape_version"] == 6
@@ -99,9 +98,9 @@ def test_same_trips_twice_only_advances_last_seen(loaded_store: Store) -> None:
     assert not loaded_store.store_feed("trips", fixture_bytes("trips.pb"), HEADER_TS + 10).stored
     newer = with_header(fixture_message("trips.pb"), HEADER_TS + 30).SerializeToString()
     result = loaded_store.store_feed("trips", newer, HEADER_TS + 33)
-    assert result.counts["tu_rows"] == 0 and result.counts["stp_rows"] == 0 and result.counts["unchanged"] == 45
+    assert result.counts["tu_rows"] == 0 and result.counts["unchanged"] == 45
     after = counts(loaded_store.conn)
-    for table in ("trip_update", "stop_time_prediction", "trip_modifications_version", "rt_shape_version"):
+    for table in ("trip_update", "trip_modifications_version", "rt_shape_version"):
         assert after[table] == before[table], table
     conn = loaded_store.conn
     assert conn.execute(
@@ -122,15 +121,22 @@ def first_arrival(message: pb.FeedMessage) -> pb.TripUpdate.StopTimeUpdate:
     raise AssertionError("no arrival in fixture")
 
 
-def test_one_changed_arrival_adds_one_row_each(loaded_store: Store) -> None:
+def test_changed_arrival_alone_adds_no_rows(loaded_store: Store) -> None:
+    """Predictions aren't stored (the raw archive keeps them), so a moved arrival
+    doesn't version the trip update; passing a stop does."""
     before = counts(loaded_store.conn)
     message = with_header(fixture_message("trips.pb"), HEADER_TS + 30)
     first_arrival(message).arrival.time += 60
     result = loaded_store.store_feed("trips", message.SerializeToString(), HEADER_TS + 33)
-    assert (result.counts["tu_rows"], result.counts["stp_rows"]) == (1, 1)
-    after = counts(loaded_store.conn)
-    assert after["trip_update"] == before["trip_update"] + 1
-    assert after["stop_time_prediction"] == before["stop_time_prediction"] + 1
+    assert result.counts["tu_rows"] == 0
+    assert counts(loaded_store.conn)["trip_update"] == before["trip_update"]
+
+    message = with_header(fixture_message("trips.pb"), HEADER_TS + 60)
+    tu = next(e.trip_update for e in message.entity if e.trip_update.trip.trip_id == "1532010")
+    del tu.stop_time_update[0]
+    result = loaded_store.store_feed("trips", message.SerializeToString(), HEADER_TS + 63)
+    assert result.counts["tu_rows"] == 1
+    assert counts(loaded_store.conn)["trip_update"] == before["trip_update"] + 1
 
 
 def test_changed_versions(loaded_store: Store) -> None:
@@ -195,7 +201,7 @@ def test_restart_inserts_nothing(loaded_store: Store, tmp_path: Path) -> None:
         assert result.stored
     after = counts(conn)
     assert after["feed_snapshot"] == before["feed_snapshot"] + 2
-    for table in ("vehicle_position", "vehicle_seen", "trip_update", "stop_time_prediction",
+    for table in ("vehicle_position", "vehicle_seen", "trip_update",
                   "trip_modifications_version", "rt_shape_version", "alert_version"):
         assert after[table] == before[table], table
 

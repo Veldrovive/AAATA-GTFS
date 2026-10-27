@@ -201,8 +201,16 @@ CREATE TABLE bustime_route_version (
 CREATE INDEX bustime_route_version_route ON bustime_route_version(route_id, fetched_at);
 """
 
+#: Stop storing the agency's per-stop predictions: they changed on almost every
+#: refresh and were ~60% of the database. The raw trips archive keeps them.
+DROP_STOP_TIME_PREDICTION = """
+DROP TABLE stop_time_prediction;
+"""
+
 #: Migration n (1-based) is MIGRATIONS[n - 1].
-MIGRATIONS = [SCHEMA_V1]
+MIGRATIONS = [SCHEMA_V1, DROP_STOP_TIME_PREDICTION]
+#: Migrations that free enough space to be worth a VACUUM afterwards.
+VACUUM_AFTER = {2}
 
 #: Tables in the order they're reported (e.g. by collector_status.py).
 TABLES = [
@@ -211,7 +219,6 @@ TABLES = [
     "vehicle_position",
     "vehicle_seen",
     "trip_update",
-    "stop_time_prediction",
     "trip_modifications_version",
     "trip_modifications_trip",
     "trip_modifications_date",
@@ -257,6 +264,8 @@ def migrate(conn: sqlite3.Connection) -> int:
     for number, script in enumerate(MIGRATIONS[version:], start=version + 1):
         # executescript commits first; wrap each migration so it applies whole or not at all.
         conn.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {number};\nCOMMIT;")
+    if version > 0 and any(n > version for n in VACUUM_AFTER):
+        conn.execute("VACUUM")
     return schema_version(conn)
 
 
