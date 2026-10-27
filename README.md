@@ -21,7 +21,7 @@ The full design is in [SPEC.md](SPEC.md); guidance for coding agents is in
 
 ```bash
 mkdir -p data                                       # so Docker doesn't create it owned by root
-printf 'UID=%s\nGID=%s\n' "$(id -u)" "$(id -g)" > .env   # only needed if you aren't 1000:1000
+printf 'UID=%s\nGID=%s\n' "$(id -u)" "$(id -g)" >> .env  # only needed if you aren't 1000:1000
 docker compose up -d --build
 docker compose logs -f collector
 ```
@@ -150,6 +150,60 @@ Storage in brief (details in SPEC.md §4):
 - `static_*` tables: every static GTFS version, so trips are looked up by service date.
 
 Scripts open the DB read-only, so they can run while the collector writes.
+
+## Moving data between machines
+
+`scripts/sync_data.py` copies the data through a cloud drive folder with
+[rclone](https://rclone.org), for machines that can't reach each other (the Pi and a
+campus computer):
+
+```bash
+uv run scripts/sync_data.py push               # on the collector's machine
+uv run scripts/sync_data.py pull --skip-rt     # where you analyse
+```
+
+`push` uploads a consistent snapshot of the database (taken with SQLite's backup API, so
+the collector keeps running; gzipped, about a fifth of the size), a `manifest.json`, and
+any new blobs. `pull` downloads them and replaces the local database. Each refuses to
+replace newer data with older (pulling on the Pi, or pushing from a copy) unless
+`--force`. Options: `--db-only`, `--skip-rt` (leave out `blobs/rt`, the raw realtime
+archives: most of the blobs, and only needed to evaluate the agency's predictions),
+`--remote`, `--data-path`. Don't pull while something has the database open.
+
+**Setup.** Install rclone on both machines: on the Pi `sudo apt install rclone` (or
+rclone.org's install script); without root, download the zip from
+rclone.org/downloads and put the `rclone` binary on your `PATH`. Then, on any machine
+with a browser and rclone, make a Google Drive remote and print its settings:
+
+```bash
+rclone config        # n (new), name: aaata, storage: drive, scope: drive.file, auto config: y
+rclone config show aaata
+```
+
+`drive.file` lets rclone see only the files it creates. Put the printed settings in the
+gitignored `.env` at the repo root on **both** machines, as `RCLONE_CONFIG_<NAME>_<KEY>`
+(rclone reads remotes from the environment, so no rclone config file is needed), plus the
+folder to use:
+
+```bash
+AAATA_GTFS_REMOTE=aaata:aaata-gtfs
+RCLONE_CONFIG_AAATA_TYPE=drive
+RCLONE_CONFIG_AAATA_SCOPE=drive.file
+RCLONE_CONFIG_AAATA_TOKEN='{"access_token":"…","token_type":"Bearer","refresh_token":"…","expiry":"…"}'
+```
+
+Single-quote the token (it's JSON). Other drives work the same way: copy every line of
+`rclone config show` (OneDrive also needs `drive_id` and `drive_type`). The token is a
+login to that drive; keep `.env` out of git (it is gitignored) and out of shared folders.
+Variables already set in the environment override `.env`, which can also set
+`AAATA_GTFS_DATA_PATH`. University Google accounts sometimes block rclone's app; a
+personal Google account or OneDrive avoids that.
+
+To push from the Pi every six hours (cron; `crontab -e`):
+
+```
+0 */6 * * * cd $HOME/projects/AAATA-GTFS && $HOME/.local/bin/uv run scripts/sync_data.py push >> data/sync.log 2>&1
+```
 
 ## Development
 

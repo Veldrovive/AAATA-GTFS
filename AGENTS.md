@@ -133,6 +133,13 @@ stages rather than flags every consumer must check.
     since scoring only those still on the trip selects on the outcome).
     `forward` and `fit` need torch (the `model` extra); the rest only numpy. **`forward.py` must agree with
     `ReferenceChain`**: change both together; `test_model.py` checks they match.
+  - `datasync.py` — copying the data between machines through an rclone remote (cloud
+    drive folder): `push` (consistent snapshot via SQLite's backup API, gzipped, plus a
+    `Manifest` and the blobs) and `pull` (replaces the local DB, deleting its stale
+    `-wal`/`-shm`). Both refuse to replace newer data (newest `feed_snapshot.fetched_at`)
+    with older unless `force`. `Remote` is the interface (`Rclone`; tests use a folder);
+    `read_env_file` / `environment` read the gitignored `.env`, where the remote is
+    configured as `RCLONE_CONFIG_<NAME>_<KEY>` variables plus `AAATA_GTFS_REMOTE`.
   - `visualization/` — `data.py`: `BusPath` (route None = not in service),
     `trace_bus_paths` (split on route change or gap), `latest_positions`
     (`LatestPosition` with `age_s`). `route_paths.py`: `route_drawings` (static shapes of
@@ -152,8 +159,10 @@ stages rather than flags every consumer must check.
   compare with the baseline fairly), all needing the `model`
   extra, and `run_simulation_study.sh` (the whole study, in parallel;
   tasks/simulation-study.md); run with
-  `uv run scripts/<name>.py`. All take `--data-path`. Everything except `collect.py` and
-  `fetch_osm_signals.py` opens the DB read-only (and that one only writes the blob).
+  `uv run scripts/<name>.py`, and `sync_data.py push|pull` (datasync; README "Moving
+  data between machines"). All take `--data-path`. Everything except `collect.py`,
+  `fetch_osm_signals.py` (which only writes the blob) and `sync_data.py pull` (which
+  replaces the DB) opens the DB read-only.
 - `tests/` — offline pytest suite over real captures in `tests/fixtures/` (see SPEC.md
   §10) and synthetic positions along fixture shapes (`test_trips.py`); `conftest.py` has the shared fixtures (`session`, `static_session`, `store`,
   `loaded_store`, `with_header` to make a "next refresh" of a fixture, and `sql()` to check
@@ -308,6 +317,11 @@ rather than pytest-asyncio.
   read-only and unexported; set both in `.env`), so `./data` stays owned by the host user.
   Create `./data` before the first `up`, or Docker creates it as root. The entrypoint runs
   the venv's python directly (not `uv run`, which needs a writable cache).
+- **`.env`** holds both compose's `UID`/`GID` and the rclone remote's settings (including
+  its OAuth token): append to it, never overwrite it. Compose only interpolates from it,
+  and `.dockerignore` excludes it, so the token never reaches the image or container.
+- **Copying the DB:** never copy `aaata_gtfs.sqlite3` with `cp`/`rsync` while the
+  collector runs (recent writes are in the `-wal`); use `datasync.snapshot_db`.
 - **Trip boundaries:** the trips feed often moves a bus to its next trip while it's still
   approaching the terminus of the last one (and drops the finished trip), while the vehicle
   feed keeps the old trip id for a few fixes after departure. `trips._label` only moves a
