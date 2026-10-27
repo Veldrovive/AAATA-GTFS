@@ -117,7 +117,9 @@ stages rather than flags every consumer must check.
     `fit.py` (`fit_adam`, `fit_lbfgs`, `mean_log_likelihood`, `observed_information`),
     `simulate.py` (`synthetic_layout`, `random_params`, `simulate_trips` (which keep the
     noise-free `true_dist_ft`), `study_setup` (a study seed's route and truth),
-    `recovery_errors` in physical units, and `forecast_targets` / `score_forecasts`).
+    `recovery_errors` in physical units, and `forecast_targets` / `score_forecasts`;
+    `forecast_targets(include_arrived=True)` also scores buses that have reached the end,
+    since scoring only those still on the trip selects on the outcome).
     `forward` and `fit` need torch (the `model` extra); the rest only numpy. **`forward.py` must agree with
     `ReferenceChain`**: change both together; `test_model.py` checks they match.
   - `visualization/` — `data.py`: `BusPath` (route None = not in service),
@@ -135,7 +137,8 @@ stages rather than flags every consumer must check.
   agency cross-check), `fetch_osm_signals.py` (run rarely, by hand; writes a blob),
   `fit_shape.py` (fits the model to one shape), `simulation_study.py` (parameter
   recovery on simulated trips), `fisher_information.py` (standard errors for a study run)
-  and `prediction_study.py` (forecast error against horizon), all needing the `model`
+  and `prediction_study.py` (forecast error against horizon; `--score-arrived` to
+  compare with the baseline fairly), all needing the `model`
   extra, and `run_simulation_study.sh` (the whole study, in parallel;
   tasks/simulation-study.md); run with
   `uv run scripts/<name>.py`. All take `--data-path`. Everything except `collect.py` and
@@ -148,8 +151,8 @@ stages rather than flags every consumer must check.
   `bus-position-model.md` is the agreed Phase 2 model design, with the implementation
   choices made so far; keep it current as decisions change.
   `simulation-study.md` is how to run the parameter-recovery and forecast study on a
-  big remote machine (it ran a 16 GB laptop out of memory), the results so far, and what
-  to do with the full results.
+  big machine (it ran a 16 GB laptop out of memory), its full results and what's next
+  (P(red) / P(stop) are identified but weakly; forecasts are as good as the truth's).
   `continuous-position-model.md` is the planned V1 of a continuous-position version of
   the model (log-normal speeds, a queued mode, computed on a fine numerical grid), with
   its open questions; settle those with the user before implementing it.

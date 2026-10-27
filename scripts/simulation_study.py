@@ -26,7 +26,7 @@ def main() -> None:
     parser.add_argument("--test-trips", type=int, default=20, help="Held-out trips (default: 20)")
     parser.add_argument("--length-mi", type=float, default=2.0, help="Route length (default: 2 mi)")
     parser.add_argument("--phases", type=int, default=8, help="Phases per wait / dwell (default: 8)")
-    parser.add_argument("--max-iter", type=int, default=150, help="L-BFGS evaluations (default: 150)")
+    parser.add_argument("--max-iter", type=int, default=150, help="L-BFGS iterations (default: 150; each runs one or more evaluations)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--threads", type=int, help="torch CPU threads")
     parser.add_argument("--out", type=Path, help="Save the true and fitted parameters here (.npz)")

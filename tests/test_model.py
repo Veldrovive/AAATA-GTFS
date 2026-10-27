@@ -198,6 +198,10 @@ def test_score_forecasts() -> None:
     # From step 4: on route at +0, at the end at +2 (not scored), past the simulation at +10.
     assert scored.tolist() == [[True, True, False], [True, False, False]]
     assert truth[0, 1] == centres[1]
+    # Scoring arrived buses at the end instead: everything is scored.
+    truth_all, scored_all = forecast_targets(trips, np.array([0, 0]), np.array([0, 4]), horizons, centres[-1],
+                                             include_arrived=True)
+    assert scored_all.all() and truth_all[1].tolist() == [centres[3], centres[9], centres[9]]
 
     # A point mass on the truth scores perfectly; one two cells ahead is 50 ft off.
     probs = np.zeros((2, 3, 10))
