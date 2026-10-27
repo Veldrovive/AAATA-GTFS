@@ -5,6 +5,7 @@ wherever you analyse. The remote is set in the gitignored .env; see the
 "Moving data between machines" section of README.md.
 """
 import argparse
+import logging
 import subprocess
 import sys
 from datetime import datetime
@@ -33,12 +34,16 @@ def main() -> None:
     parser.add_argument("--skip-rt", action="store_true",
                         help="Skip the raw realtime archives (blobs/rt: most of the blobs; not needed to fit models)")
     parser.add_argument("--force", action="store_true", help="Replace the other side even if it has newer data")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Log each file copied, and the rclone commands")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    if args.verbose:
+        logging.getLogger("aaata_gtfs").setLevel(logging.DEBUG)
     if not args.remote:
         sys.exit(f"no remote: set {REMOTE_ENV} in .env (e.g. {REMOTE_ENV}=aaata:aaata-gtfs) or pass --remote")
 
     try:
-        remote = Rclone(args.remote, env)
+        remote = Rclone(args.remote, env, verbose=args.verbose)
         if args.direction == "push":
             manifest = push(args.data_path, remote, blobs=not args.db_only, rt_blobs=not args.skip_rt,
                             force=args.force)

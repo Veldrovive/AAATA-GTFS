@@ -168,7 +168,9 @@ any new blobs. `pull` downloads them and replaces the local database. Each refus
 replace newer data with older (pulling on the Pi, or pushing from a copy) unless
 `--force`. Options: `--db-only`, `--skip-rt` (leave out `blobs/rt`, the raw realtime
 archives: most of the blobs, and only needed to evaluate the agency's predictions),
-`--remote`, `--data-path`. Don't pull while something has the database open.
+`--remote`, `--data-path`, `--verbose` (each file copied, and the rclone commands). Each
+step is logged with how long it took, and transfers log rclone's progress every 15 s.
+Don't pull while something has the database open.
 
 **Setup.** Install rclone on both machines: on the Pi `sudo apt install rclone` (or
 rclone.org's install script); without root, download the zip from

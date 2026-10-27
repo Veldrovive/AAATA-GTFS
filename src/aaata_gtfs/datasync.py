@@ -16,13 +16,15 @@ environment (`RCLONE_CONFIG_<NAME>_<KEY>`), usually from the gitignored `.env`
 
 import gzip
 import json
+import logging
 import os
 import shutil
 import socket
 import sqlite3
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
@@ -33,6 +35,8 @@ from sqlmodel import Session
 from aaata_gtfs import db
 from aaata_gtfs import models as m
 from aaata_gtfs.config import BLOBS_DIR, REPO_ROOT, blob_path, db_path
+
+log = logging.getLogger(__name__)
 
 ENV_FILE = REPO_ROOT / ".env"
 #: The rclone path of the folder holding the copy, e.g. `aaata:aaata-gtfs`.
@@ -69,27 +73,42 @@ class Remote(Protocol):
 
 
 class Rclone:
-    """`Remote` over the `rclone` command; `root` is an rclone path such as `aaata:aaata-gtfs`."""
+    """`Remote` over the `rclone` command; `root` is an rclone path such as `aaata:aaata-gtfs`.
 
-    def __init__(self, root: str, env: Mapping[str, str] | None = None, binary: str = "rclone") -> None:
+    Transfers log rclone's one-line progress every `stats_s` seconds; `verbose`
+    also logs each file copied.
+    """
+
+    def __init__(self, root: str, env: Mapping[str, str] | None = None, binary: str = "rclone",
+                 verbose: bool = False, stats_s: int = 15) -> None:
         if shutil.which(binary) is None:
             raise SyncError(f"{binary} not found; install it (https://rclone.org/install/)")
         self.root = root.rstrip("/")
         self.env = dict(os.environ if env is None else env)
         self.binary = binary
+        self.global_args: list[str] = []
+        # A remote defined in the environment needs no config file: say so, or rclone
+        # prints a "config file not found" notice on every call.
+        name = self.root.split(":", 1)[0].upper()
+        if f"RCLONE_CONFIG_{name}_TYPE" in self.env and "RCLONE_CONFIG" not in self.env:
+            self.global_args += ["--config", ""]
+        self.transfer_args = ["--stats", f"{stats_s}s", "--stats-one-line", "--stats-log-level", "NOTICE"]
+        if verbose:
+            self.transfer_args.append("-v")
 
     def _path(self, name: str) -> str:
         return f"{self.root}/{name}"
 
     def _run(self, *args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([self.binary, *args], env=self.env, check=True, text=True,
-                              capture_output=capture)
+        command = [self.binary, *self.global_args, *args]
+        log.debug("running %s", " ".join(command))
+        return subprocess.run(command, env=self.env, check=True, text=True, capture_output=capture)
 
     def upload(self, local: Path, name: str) -> None:
-        self._run("copyto", str(local), self._path(name))
+        self._run("copyto", *self.transfer_args, str(local), self._path(name))
 
     def download(self, name: str, local: Path) -> None:
-        self._run("copyto", self._path(name), str(local))
+        self._run("copyto", *self.transfer_args, self._path(name), str(local))
 
     def read_text(self, name: str) -> str | None:
         try:
@@ -100,13 +119,17 @@ class Rclone:
             raise SyncError(f"rclone cat {self._path(name)} failed: {e.stderr.strip()}") from e
         return out or None
 
+    # --fast-list lists the remote tree in a few requests rather than one per
+    # directory (the realtime archive has one per feed and day).
     def upload_dir(self, local: Path, name: str, exclude: Sequence[str] = ()) -> None:
         # The current hour's realtime archive is appended to while it uploads; the
         # next push copies it whole.
-        self._run("copy", "--local-no-check-updated", str(local), self._path(name), *_excludes(exclude))
+        self._run("copy", *self.transfer_args, "--fast-list", "--local-no-check-updated",
+                  str(local), self._path(name), *_excludes(exclude))
 
     def download_dir(self, name: str, local: Path, exclude: Sequence[str] = ()) -> None:
-        self._run("copy", self._path(name), str(local), *_excludes(exclude))
+        self._run("copy", *self.transfer_args, "--fast-list", self._path(name), str(local),
+                  *_excludes(exclude))
 
 
 def _excludes(dirs: Sequence[str]) -> list[str]:
@@ -173,6 +196,24 @@ def remote_manifest(remote: Remote) -> Manifest | None:
     return None if text is None else Manifest(**json.loads(text))
 
 
+def _mb(path: Path) -> str:
+    return f"{path.stat().st_size / 1e6:.1f} MB"
+
+
+@contextmanager
+def _step(what: str) -> Iterator[None]:
+    """Log `what` as it starts, and how long it took."""
+    log.info("%s...", what)
+    t0 = time.monotonic()
+    yield
+    log.info("%s: done in %.1f s", what, time.monotonic() - t0)
+
+
+def _blob_summary(root: Path, exclude: Sequence[str]) -> str:
+    files = [p for p in root.rglob("*") if p.is_file() and p.relative_to(root).parts[0] not in exclude]
+    return f"{len(files)} files, {sum(p.stat().st_size for p in files) / 1e6:.0f} MB"
+
+
 def push(data_path: Path, remote: Remote, blobs: bool = True, rt_blobs: bool = True,
          force: bool = False) -> Manifest:
     """Upload a snapshot of the database (and the blobs) to `remote`.
@@ -184,29 +225,36 @@ def push(data_path: Path, remote: Remote, blobs: bool = True, rt_blobs: bool = T
     if not src.exists():
         raise SyncError(f"no database at {src}")
     latest = latest_fetched_at(src)
-    current = remote_manifest(remote)
+    with _step("reading the remote manifest"):
+        current = remote_manifest(remote)
     if current is not None and _is_newer(current.latest_fetched_at, latest) and not force:
         raise SyncError(f"the remote copy (pushed from {current.host}) has newer data than {src}; "
                         "pass --force to replace it anyway")
     snapshot = data_path / ".push-snapshot.sqlite3"
     packed = data_path / ".push-snapshot.sqlite3.gz"
     try:
-        snapshot_db(src, snapshot)
-        with snapshot.open("rb") as f_in, gzip.open(packed, "wb", compresslevel=6) as f_out:
-            shutil.copyfileobj(f_in, f_out)
+        with _step(f"snapshotting {src} ({_mb(src)})"):
+            snapshot_db(src, snapshot)
+        with _step(f"compressing the snapshot ({_mb(snapshot)})"):
+            with snapshot.open("rb") as f_in, gzip.open(packed, "wb", compresslevel=6) as f_out:
+                shutil.copyfileobj(f_in, f_out)
         manifest = Manifest(latest, time.time(), socket.gethostname(), snapshot.stat().st_size)
-        remote.upload(packed, REMOTE_DB)
+        with _step(f"uploading the database ({_mb(packed)} compressed)"):
+            remote.upload(packed, REMOTE_DB)
         manifest_file = data_path / ".push-manifest.json"
         manifest_file.write_text(json.dumps(asdict(manifest), indent=2) + "\n")
         try:
-            remote.upload(manifest_file, REMOTE_MANIFEST)
+            with _step("uploading the manifest"):
+                remote.upload(manifest_file, REMOTE_MANIFEST)
         finally:
             manifest_file.unlink(missing_ok=True)
     finally:
         snapshot.unlink(missing_ok=True)
         packed.unlink(missing_ok=True)
     if blobs and blob_path(data_path).exists():
-        remote.upload_dir(blob_path(data_path), BLOBS_DIR, exclude=() if rt_blobs else (RT_BLOBS,))
+        exclude = () if rt_blobs else (RT_BLOBS,)
+        with _step(f"copying new blobs (of {_blob_summary(blob_path(data_path), exclude)} here)"):
+            remote.upload_dir(blob_path(data_path), BLOBS_DIR, exclude=exclude)
     return manifest
 
 
@@ -227,7 +275,8 @@ def pull(data_path: Path, remote: Remote, blobs: bool = True, rt_blobs: bool = T
     remote manifest, or None if the local database was already that copy.
     Don't pull while something has the local database open.
     """
-    manifest = remote_manifest(remote)
+    with _step("reading the remote manifest"):
+        manifest = remote_manifest(remote)
     if manifest is None:
         raise SyncError("nothing has been pushed to the remote yet")
     dest = db_path(data_path)
@@ -238,18 +287,23 @@ def pull(data_path: Path, remote: Remote, blobs: bool = True, rt_blobs: bool = T
                         "pass --force to replace it anyway")
     result: Manifest | None = manifest
     if dest.exists() and local == manifest.latest_fetched_at and not force:
+        log.info("the local database is already the remote copy; not downloading it")
         result = None
     else:
         packed = data_path / ".pull.sqlite3.gz"
         unpacked = data_path / ".pull.sqlite3"
         try:
-            remote.download(REMOTE_DB, packed)
-            with gzip.open(packed, "rb") as f_in, unpacked.open("wb") as f_out:
-                shutil.copyfileobj(f_in, f_out)
+            with _step("downloading the database"):
+                remote.download(REMOTE_DB, packed)
+            with _step(f"decompressing it ({_mb(packed)})"):
+                with gzip.open(packed, "rb") as f_in, unpacked.open("wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
             install_db(unpacked, dest)
+            log.info("replaced %s (%s)", dest, _mb(dest))
         finally:
             packed.unlink(missing_ok=True)
             unpacked.unlink(missing_ok=True)
     if blobs:
-        remote.download_dir(BLOBS_DIR, blob_path(data_path), exclude=() if rt_blobs else (RT_BLOBS,))
+        with _step("copying new blobs" + ("" if rt_blobs else f" (not {RT_BLOBS}/)")):
+            remote.download_dir(BLOBS_DIR, blob_path(data_path), exclude=() if rt_blobs else (RT_BLOBS,))
     return result
