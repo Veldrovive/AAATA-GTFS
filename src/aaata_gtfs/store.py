@@ -128,8 +128,10 @@ class _TripState:
     last_seen: float  # our clock, for pruning
 
 
+#: The trip-level fields a new `trip_update` version is stored for. Not `update_ts`: the
+#: feed stamps every trip update on every refresh, so a version keeps the first one's.
 _TRIP_FIELDS = (
-    "vehicle_id", "update_ts", "schedule_relationship", "modifications_id", "delay",
+    "vehicle_id", "schedule_relationship", "modifications_id", "delay",
     "first_stop_sequence", "n_stop_time_updates", "route_id",
 )
 
@@ -147,7 +149,7 @@ _VersionRow = TripModificationsVersion | RtShapeVersion | AlertVersion | BusTime
 
 def _trip_fields(record: TripUpdateRecord) -> tuple[object, ...]:
     return (
-        record.vehicle_id, record.update_ts, record.schedule_relationship, record.modifications_id,
+        record.vehicle_id, record.schedule_relationship, record.modifications_id,
         record.delay, record.first_stop_sequence, record.n_stop_time_updates, record.route_id,
     )
 

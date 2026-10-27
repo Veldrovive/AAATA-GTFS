@@ -121,6 +121,18 @@ def first_arrival(message: pb.FeedMessage) -> pb.TripUpdate.StopTimeUpdate:
     raise AssertionError("no arrival in fixture")
 
 
+def test_new_timestamps_alone_add_no_rows(loaded_store: Store) -> None:
+    """The feed restamps every trip update each refresh; that isn't a new version."""
+    before = counts(loaded_store.session)
+    message = with_header(fixture_message("trips.pb"), HEADER_TS + 30)
+    for entity in message.entity:
+        if entity.HasField("trip_update"):
+            entity.trip_update.timestamp = HEADER_TS + 28
+    result = loaded_store.store_feed("trips", message.SerializeToString(), HEADER_TS + 33)
+    assert result.counts["tu_rows"] == 0 and result.counts["unchanged"] == 45
+    assert counts(loaded_store.session)["trip_update"] == before["trip_update"]
+
+
 def test_changed_arrival_alone_adds_no_rows(loaded_store: Store) -> None:
     """Predictions aren't stored (the raw archive keeps them), so a moved arrival
     doesn't version the trip update; passing a stop does."""

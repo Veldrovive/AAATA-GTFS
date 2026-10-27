@@ -459,7 +459,7 @@ the cache key when `service_date` is NULL):
    uncertainties, schedule_relationship)` keyed by `stop_sequence`.
 2. Compare each one with the last stored tuple for `(trip_id, service_date,
    stop_sequence)`. Collect the changed ones.
-3. If any stop changed, or any trip-level field (`vehicle_id`, `update_ts`,
+3. If any stop changed, or any trip-level field (`vehicle_id`,
    `schedule_relationship`, `modifications_id`, `delay`, `first_stop_sequence`,
    `n_stop_time_updates`, `route_id`) differs from the last stored `trip_update` row for the
    key: insert a new `trip_update` row, then insert the changed stops referencing it.
@@ -471,7 +471,8 @@ also records when stops drop out of the list (`first_stop_sequence` changes), wh
 approximates when each stop was passed, to within a feed refresh.
 
 **Since migration 2, `stop_time_prediction` is gone and step 1–2 are skipped:** a
-`trip_update` row is versioned on its trip-level fields only. In practice the agency moved
+`trip_update` row is versioned on its trip-level fields only, not `update_ts` (the feed
+restamps every trip update on every refresh; a version keeps its first refresh's). In practice the agency moved
 every listed stop's prediction (mostly by 0–30 s) on every refresh, so no stop-time update
 was ever deduped and the table and its indexes were ~60% of the database (~180 MB a day).
 Predictions are only needed to evaluate the agency's accuracy, so that evaluation reads

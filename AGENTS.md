@@ -299,7 +299,9 @@ rather than pytest-asyncio.
 - **Per-stop predictions aren't in the DB** (dropped in legacy migration 2): the agency moves
   every stop's time on every refresh, so they were ~60% of the database. Read them from
   the raw trips archive (`filestore.iter_rt`) when evaluating the agency's predictions.
-  `trip_update` versions on trip-level fields only; `update_ts` still changes most refreshes.
+  `trip_update` versions on trip-level fields only, ignoring `update_ts` (restamped every
+  refresh; a version keeps its first). `n_stop_time_updates` alone still changes often (the
+  agency's look-ahead window).
 - Route-level data only changes between checks (hourly BusTime, 6-hourly static), so
   changes are timed to within that interval.
 - **Docker:** the compose service runs as `${UID:-1000}:${GID:-1000}` (bash's `UID` is
