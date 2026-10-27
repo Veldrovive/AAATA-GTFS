@@ -93,6 +93,10 @@ Costs measured on the Xeon, 6 threads per job, 10 jobs at once:
 
 ## Results (Xeon, 400 iterations)
 
+These ran with the old speed generator, whose segments were all ~16–55 mph (see
+bus-position-model.md, "Parameter recovery"); a rerun covers 2–40 mph, slow traffic
+included.
+
 The 2 mi route has 424 cells, 8 stops, 5 lights and 14 segments. The training
 log-likelihood of every fit is above the truth's (40 trips: by 0.04–0.06 per
 observation), and its held-out log-likelihood below (40 trips: by 0.05–0.07; 320 trips:

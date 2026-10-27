@@ -149,9 +149,18 @@ Choices made while implementing (open to change):
 ### Parameter recovery (simulation)
 
 `scripts/simulation_study.py` draws physically varied true parameters
-(`simulate.random_params`: speeds 8–40 mph, P(red) 0.2–0.7, red waits 15–60 s, P(stop)
+(`simulate.random_params`: speeds 2–40 mph, P(red) 0.2–0.7, red waits 15–60 s, P(stop)
 0.2–0.9, dwells 8–40 s), simulates trips on a synthetic route at the feed's 25–35 s
 cadence, fits by L-BFGS from uninformed values and reports errors in physical units.
+
+A slow segment is mostly halts: 5 ft/s is `move_probs ≈ [0.8, 0.2, 0, 0]`, so a segment's
+speed is its mean advance, not the cell size. (Over 30 s that crawl has an sd of ~55 ft,
+more than a steady crawl would, and i.i.d. steps don't persist: both are arguments for the
+speed regime above.) **The results below predate a generator fix (2026-10-26):** the old
+`_advance_probs` always moved 1–3 cells on a moving step and halted only 3–15% of the
+time, so its slowest segment was ~16 mph whatever the target (the "8–40 mph" range was
+really ~16–55). Errors were measured against the realised truth, so they stand, but slow
+segments were never tested; rerun the study.
 
 Seed 0, 2 mi route (424 cells, 8 stops, 5 lights, 14 segments), 40 training trips (841
 observations), 20 held out; 155 evaluations, 15 min on the Pi:

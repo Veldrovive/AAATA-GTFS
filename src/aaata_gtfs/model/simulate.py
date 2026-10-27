@@ -54,13 +54,17 @@ def synthetic_layout(
 
 
 def _advance_probs(speed_mph: float, layout: Layout, p_halt: float) -> np.ndarray:
-    """Advance probabilities with about the given mean speed: `p_halt` at 0, the
-    rest a discretised normal around the matching advance."""
+    """Advance probabilities with the given mean speed: a discretised normal over
+    moving advances (1 … max_advance cells) around the advance that `p_halt` at 0
+    would need, then the halt probability set so the mean is exact. Slow speeds
+    (below one cell per step) come out as mostly halts; above the fastest
+    reachable mean, the halt probability is 0 and the mean falls short."""
     a = speed_mph * FTPS_PER_MPH / layout.cell_ft
-    j = np.arange(layout.max_advance + 1)
-    w = np.exp(-0.5 * ((j - a) / 0.7) ** 2)
-    w[0] = 0.0
-    return np.concatenate([[p_halt], (1 - p_halt) * w[1:] / w[1:].sum()])
+    j = np.arange(1, layout.max_advance + 1)
+    w = np.exp(-0.5 * ((j - a / (1 - p_halt)) / 0.7) ** 2)
+    w /= w.sum()
+    halt = float(np.clip(1 - a / (w @ j), 0.0, 1.0))
+    return np.concatenate([[halt], (1 - halt) * w])
 
 
 def _phase_type(rng: np.random.Generator, n: int, n_phases: int, low_s: float, high_s: float) -> tuple[np.ndarray, np.ndarray]:
@@ -75,7 +79,7 @@ def random_params(
     layout: Layout,
     rng: np.random.Generator,
     n_phases: int,
-    speed_mph: tuple[float, float] = (8.0, 40.0),
+    speed_mph: tuple[float, float] = (2.0, 40.0),
     p_red: tuple[float, float] = (0.2, 0.7),
     red_wait_s: tuple[float, float] = (15.0, 60.0),
     p_stop: tuple[float, float] = (0.2, 0.9),
@@ -142,7 +146,7 @@ def simulate_trips(
 
 
 def segment_speeds_mph(params: ModelParams, layout: Layout) -> np.ndarray:
-    """Mean moving speed on each segment (mph): mean advance per 1 s step."""
+    """Mean speed on each segment (mph): mean advance per 1 s step, halts included."""
     advance_ft = np.arange(layout.max_advance + 1) * layout.cell_ft
     return params.move_probs @ advance_ft / FTPS_PER_MPH
 
